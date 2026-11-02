@@ -5,6 +5,7 @@ import * as skills from './skills.js';
 import { today } from './time.js';
 import { tryLock, unlock, sleep } from './store.js';
 import { HttpError } from './errors.js';
+import { json } from './json.js';
 
 const REUSE_AFTER_DAYS = 30;
 const STRETCH = 0.25;   // aim slightly above current ability
@@ -16,7 +17,7 @@ const bandFor = target => Math.min(6, Math.max(1, roundHalf(target)));
 export async function insertItems(db, type, difficulty, contents, source = 'ai') {
   const rows = await db.q(`insert into public.items (type, difficulty, content, source)
                            select $1, $2::float8, x, $3 from jsonb_array_elements($4::jsonb) as x
-                           returning id`, [type, difficulty, source, JSON.stringify(contents)]);
+                           returning id`, [type, difficulty, source, json(contents)]);
   return rows.map(r => r.id);
 }
 
@@ -110,8 +111,8 @@ export async function submit(ctx, { itemId, response, seconds, mode = 'practice'
   const row = await ctx.db.one(`insert into public.attempts (item_id, type, mode, response, score, raw_score, max_score, feedback, seconds, day)
                                 values ($1, $2, $3, $4::jsonb, $5::float8, $6::float8, $7::float8, $8::jsonb, $9::int, $10)
                                 returning id`,
-    [itemId, type, mode, JSON.stringify(response), result.score, result.raw, result.max,
-      JSON.stringify(feedback), Math.round(seconds || 0), today()]);
+    [itemId, type, mode, json(response), result.score, result.raw, result.max,
+      json(feedback), Math.round(seconds || 0), today()]);
   ctx.bg(c => topUp(c, type)); // refill after the response is sent
   return { attemptId: row.id, type, score: result.score, raw: result.raw, max: result.max, feedback, rating, before };
 }

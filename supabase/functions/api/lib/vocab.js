@@ -3,6 +3,7 @@
 import { today, addDays } from './time.js';
 import { getSetting, setSetting, tryLock, unlock, isLocked, sleep } from './store.js';
 import { HttpError } from './errors.js';
+import { json } from './json.js';
 
 // Review intervals in days.
 export const STEPS = [1, 2, 4, 7, 14, 21, 45, 90];
@@ -43,7 +44,7 @@ async function refillPool(ctx) {
     const words = await ctx.ai.vocabCandidates(band, recentWords, ctx.charge);
     await ctx.db.q(`insert into public.words (word, topic, band)
                     select x->>'w', x->>'topic', $2::float8 from jsonb_array_elements($1::jsonb) as x
-                    on conflict (user_id, word) do nothing`, [JSON.stringify(words), band]);
+                    on conflict (user_id, word) do nothing`, [json(words), band]);
     return true;
   } finally {
     await unlock(ctx.db, 'pool');
@@ -136,7 +137,7 @@ export async function makeCards(ctx, { fullBatchesOnly = false } = {}) {
 
 async function saveCards(db, rows) {
   await db.q(`update public.words w set card = x.card
-              from jsonb_to_recordset($1::jsonb) as x(id int, card jsonb) where w.id = x.id`, [JSON.stringify(rows)]);
+              from jsonb_to_recordset($1::jsonb) as x(id int, card jsonb) where w.id = x.id`, [json(rows)]);
 }
 
 // ---------- review ----------

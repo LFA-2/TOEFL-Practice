@@ -3,6 +3,7 @@ import { TASKS } from './tasks.js';
 import { allSkills } from './skills.js';
 import { today, daysBetween, weekday } from './time.js';
 import { getSetting, setSetting } from './store.js';
+import { json } from './json.js';
 import * as vocab from './vocab.js';
 
 const DEFAULTS = {
@@ -121,7 +122,7 @@ export async function getPlan(db, day = today()) {
 
 async function savePlan(db, day, plan) {
   await db.q(`insert into public.plans (day, tasks) values ($1, $2::jsonb)
-              on conflict (user_id, day) do update set tasks = excluded.tasks`, [day, JSON.stringify(plan)]);
+              on conflict (user_id, day) do update set tasks = excluded.tasks`, [day, json(plan)]);
 }
 
 export async function resetToday(db, day = today()) {

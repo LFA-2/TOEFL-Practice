@@ -32,7 +32,8 @@ async function runAs(uid, fn) {
     await c.simple('begin');
     await c.query(`select set_config('request.jwt.claims', $1, true), set_config('role', 'authenticated', true)`,
       [JSON.stringify({ sub: uid, role: 'authenticated' })]);
-    const out = await fn((text, params) => c.query(text, params));
+    // the test client sends text, so jsonb values are encoded here once, like the real driver does
+    const out = await fn((text, params) => c.query(text, params.map(p => (p && p.constructor?.name === 'Json' ? JSON.stringify(p.value) : p))));
     await c.simple('commit');
     return out;
   } catch (e) {

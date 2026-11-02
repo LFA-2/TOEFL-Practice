@@ -6,9 +6,11 @@ export async function getSetting(db, key, fallback = null) {
   return row ? row.value : fallback;
 }
 
+import { json } from './json.js';
+
 export async function setSetting(db, key, value) {
   await db.q(`insert into public.settings (key, value) values ($1, $2::jsonb)
-              on conflict (user_id, key) do update set value = excluded.value`, [key, JSON.stringify(value)]);
+              on conflict (user_id, key) do update set value = excluded.value`, [key, json(value)]);
 }
 
 // Takes the lock if it is free or expired. Returns true when this caller holds it.

@@ -10,6 +10,7 @@
 import postgres from 'npm:postgres@3.4.5';
 import { createHandler } from './app.js';
 import { makeAi } from './lib/ai.js';
+import { Json } from './lib/json.js';
 
 const env = name => Deno.env.get(name) || '';
 const SUPABASE_URL = env('SUPABASE_URL');
@@ -21,7 +22,9 @@ async function runAs(uid, fn) {
   return sql.begin(async tx => {
     await tx.unsafe(`select set_config('request.jwt.claims', $1, true), set_config('role', 'authenticated', true)`,
       [JSON.stringify({ sub: uid, role: 'authenticated' })]);
-    return fn(async (text, params) => [...(await tx.unsafe(text, params))]);
+    // Json values go to the driver as real jsonb (see lib/json.js); everything else is passed as is.
+    const bind = params => params.map(p => (p instanceof Json ? tx.json(p.value) : p));
+    return fn(async (text, params) => [...(await tx.unsafe(text, bind(params)))]);
   });
 }
 

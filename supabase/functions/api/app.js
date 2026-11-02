@@ -14,11 +14,13 @@ import * as bank from './lib/bank.js';
 import * as plan from './lib/plan.js';
 import * as skills from './lib/skills.js';
 import * as vocab from './lib/vocab.js';
+import { Json } from './lib/json.js';
 
 // ---------- database wrapper ----------
 // Parameters are sent untyped; queries cast them where the type matters.
 function param(v) {
   if (v === undefined || v === null) return null;
+  if (v instanceof Json) return v; // bound later by index.ts (or the test server) as jsonb
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (Array.isArray(v)) return `{${v.map(x => (typeof x === 'number' ? x : `"${String(x).replace(/["\\]/g, '\\$&')}"`)).join(',')}}`;
   if (typeof v === 'object') return JSON.stringify(v);
