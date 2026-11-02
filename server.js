@@ -44,11 +44,18 @@ function serveStatic(req, res, pathname) {
   if (!file.startsWith(PUBLIC)) return send(res, 403, { error: 'forbidden' });
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(PUBLIC, 'index.html');
   const ext = path.extname(file);
-  res.writeHead(200, {
+  const st = fs.statSync(file);
+  const etag = `"${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
+  // Code and styles are always revalidated, so a `git pull` + restart reaches every browser at once.
+  // Icons rarely change and may be cached for a day.
+  const headers = {
     'content-type': MIME[ext] || 'application/octet-stream',
-    'cache-control': ext === '.html' || file.endsWith('sw.js') ? 'no-cache' : 'public, max-age=3600',
+    'cache-control': ext === '.png' ? 'public, max-age=86400' : 'no-cache',
+    etag,
     'x-content-type-options': 'nosniff',
-  });
+  };
+  if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); return res.end(); }
+  res.writeHead(200, headers);
   fs.createReadStream(file).pipe(res);
 }
 
