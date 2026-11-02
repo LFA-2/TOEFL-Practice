@@ -1,9 +1,9 @@
 // Builds the daily task list from exam date, target band and current ability.
-const { db, getSetting } = require('./db');
-const { TASKS } = require('./tasks');
-const { allSkills } = require('./skills');
-const { today, daysBetween, weekday } = require('./time');
-const vocab = require('./vocab');
+import { TASKS } from './tasks.js';
+import { allSkills } from './skills.js';
+import { today, daysBetween, weekday } from './time.js';
+import { getSetting, setSetting } from './store.js';
+import * as vocab from './vocab.js';
 
 const DEFAULTS = {
   examDate: '2027-01-30',
@@ -12,8 +12,12 @@ const DEFAULTS = {
   minutesWeekend: 120,
 };
 
-function settings() {
-  return { ...DEFAULTS, ...getSetting('plan', {}) };
+export async function settings(db) {
+  return { ...DEFAULTS, ...(await getSetting(db, 'plan', {})) };
+}
+
+export async function saveSettings(db, s) {
+  await setSetting(db, 'plan', s);
 }
 
 function phaseFor(daysLeft) {
@@ -24,17 +28,17 @@ function phaseFor(daysLeft) {
   return { key: 'base', zh: '打底期', factor: 1 };
 }
 
-function buildPlan(day) {
-  const s = settings();
+export async function buildPlan(db, day) {
+  const s = await settings(db);
   const daysLeft = daysBetween(day, s.examDate);
   const phase = phaseFor(daysLeft);
   const wd = weekday(day);
   const total = Math.round(((wd === 0 || wd === 6) ? s.minutesWeekend : s.minutesWeekday) * phase.factor);
   // Vocabulary comes off the top, but always leaves at least half the time for test tasks.
-  const vt = vocab.planTasks(day);
+  const vt = await vocab.planTasks(db, day);
   const vocabMinutes = Math.min(Math.round(total / 2), vt.screen.minutes + vt.review.minutes);
   const budget = total - vocabMinutes;
-  const skills = allSkills();
+  const skills = await allSkills(db);
   const tasks = [];
 
   // 1. Any task type never attempted is part of the diagnostic.
@@ -91,33 +95,33 @@ function buildPlan(day) {
 
 // Plans are frozen once created for the day, so they don't shift mid-session.
 // A diagnostic plan is the exception: it's rebuilt until the diagnostic is complete.
-function getPlan(day = today()) {
-  const row = db.prepare('SELECT tasks FROM plans WHERE day = ?').get(day);
-  let plan = row ? JSON.parse(row.tasks) : null;
+export async function getPlan(db, day = today()) {
+  const row = await db.one('select tasks from public.plans where day = $1', [day]);
+  let plan = row ? row.tasks : null;
   if (!plan) {
-    plan = buildPlan(day);
-    savePlan(day, plan);
-  } else if (plan.diagnostic && !buildPlan(day).diagnostic) {
+    plan = await buildPlan(db, day);
+    await savePlan(db, day, plan);
+  } else if (plan.diagnostic && !(await buildPlan(db, day)).diagnostic) {
     // diagnostic finished today: keep today's list, but mark it complete
     plan.diagnostic = false;
     plan.diagnosticDone = true;
-    savePlan(day, plan);
+    await savePlan(db, day, plan);
   }
   const done = Object.fromEntries(
-    db.prepare('SELECT type, COUNT(*) c FROM attempts WHERE day = ? GROUP BY type').all(day).map(r => [r.type, r.c]));
+    (await db.q('select type, count(*)::int as c from public.attempts where day = $1 group by type', [day])).map(r => [r.type, r.c]));
   plan.tasks = plan.tasks.map(t => ({ ...t, done: Math.min(done[t.type] || 0, t.target) }));
-  plan.vocab = vocab.planTasks(day); // live counts, not frozen
-  plan.settings = settings();
+  plan.vocab = await vocab.planTasks(db, day); // live counts, not frozen
+  plan.settings = await settings(db);
   return plan;
 }
 
-function savePlan(day, plan) {
-  db.prepare('INSERT INTO plans(day, tasks) VALUES(?, ?) ON CONFLICT(day) DO UPDATE SET tasks = excluded.tasks')
-    .run(day, JSON.stringify(plan));
+async function savePlan(db, day, plan) {
+  await db.q(`insert into public.plans (day, tasks) values ($1, $2::jsonb)
+              on conflict (user_id, day) do update set tasks = excluded.tasks`, [day, JSON.stringify(plan)]);
 }
 
-function resetToday(day = today()) {
-  db.prepare('DELETE FROM plans WHERE day = ?').run(day);
+export async function resetToday(db, day = today()) {
+  await db.q('delete from public.plans where day = $1', [day]);
 }
 
-module.exports = { getPlan, buildPlan, settings, resetToday, DEFAULTS };
+export { DEFAULTS };

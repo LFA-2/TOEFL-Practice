@@ -1,0 +1,7 @@
+# Supabase CLI configuration (only the parts this project changes).
+project_id = "toefl-coach"
+
+[functions.api]
+# The function checks the access token itself (lib: app.js → getUser), which also works with
+# Supabase's newer asymmetric JWT signing keys.
+verify_jwt = false

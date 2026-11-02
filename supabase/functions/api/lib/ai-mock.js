@@ -64,4 +64,4 @@ function respond(system, prompt) {
   return j({});
 }
 
-module.exports = { respond };
+export { respond };

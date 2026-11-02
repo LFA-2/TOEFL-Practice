@@ -1,12 +1,12 @@
 {
   "name": "toefl-coach",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Personal adaptive practice for the 2026 TOEFL iBT. Zero dependencies.",
+  "description": "Personal adaptive practice for the 2026 TOEFL iBT: static PWA + Supabase (Postgres, Auth, Edge Function).",
   "engines": { "node": ">=22.13" },
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server.js",
-    "generate": "node --disable-warning=ExperimentalWarning scripts/generate.js",
-    "dev": "AI_MOCK=1 node --disable-warning=ExperimentalWarning --watch server.js"
+    "dev": "AI_MOCK=1 node --no-warnings test/dev-server.mjs",
+    "test": "node --no-warnings test/api-test.mjs",
+    "import-sql": "node --no-warnings tools/sqlite-to-sql.js"
   }
 }

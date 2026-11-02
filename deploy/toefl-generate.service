@@ -1,7 +1,0 @@
-[Unit]
-Description=TOEFL Coach nightly item generation
-
-[Service]
-Type=oneshot
-WorkingDirectory=%h/TOEFL-Practice
-ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning scripts/generate.js

@@ -19,13 +19,73 @@ const store = {
 };
 
 class AuthError extends Error {}
+class PendingError extends Error {}
 
-async function api(path, body) {
-  const res = await fetch(path, body === undefined ? {} : {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-  });
-  if (res.status === 401 && path !== '/api/login') throw new AuthError();
+// ---------- Supabase auth (plain fetch, no SDK) ----------
+const CFG = window.TOEFL_CONFIG;
+const AUTH = `${CFG.supabaseUrl}/auth/v1`;
+const FN = `${CFG.supabaseUrl}/functions/v1/api`;
+const SESSION_KEY = 'toefl-auth';
+let ME = null; // { email, approved, usage } once checked
+
+const session = {
+  get() { try { return JSON.parse(store.get(SESSION_KEY)); } catch { return null; } },
+  set(s) { store.set(SESSION_KEY, JSON.stringify({ access_token: s.access_token, refresh_token: s.refresh_token, expires_at: s.expires_at, email: s.user?.email })); },
+  clear() { store.del(SESSION_KEY); ME = null; },
+};
+
+// Supabase Auth error messages, in Traditional Chinese.
+function authMessage(data, status) {
+  const m = String(data.msg || data.error_description || data.message || data.error || '');
+  if (/invalid login credentials|invalid_credentials/i.test(m)) return 'Email 或密碼錯誤。';
+  if (/already registered|already exists/i.test(m)) return '這個 Email 已經註冊過了，請直接登入。';
+  if (/password should be|weak/i.test(m)) return '密碼太短，至少需要 8 個字元。';
+  if (/email not confirmed/i.test(m)) return '這個 Email 還沒有確認，請先點信裡的確認連結。';
+  if (/invalid email|unable to validate email/i.test(m)) return 'Email 格式不正確。';
+  if (/rate limit|too many/i.test(m) || status === 429) return '嘗試太多次了，請稍後再試。';
+  if (/signups not allowed|signup is disabled/i.test(m)) return '目前不開放註冊。';
+  return m || `登入服務錯誤（HTTP ${status}）`;
+}
+
+async function authPost(path, body, token) {
+  let res;
+  try {
+    res = await fetch(AUTH + path, { method: 'POST', body: JSON.stringify(body),
+      headers: { apikey: CFG.publishableKey, 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+  } catch { throw new Error('無法連線，請確認網路後再試。'); }
   const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(authMessage(data, res.status));
+  return data;
+}
+
+let refreshing = null;
+async function accessToken() {
+  const s = session.get();
+  if (!s) return null;
+  if (s.expires_at * 1000 - 60_000 > Date.now()) return s.access_token;
+  // expired or about to: trade the refresh token for a new session (one request at a time)
+  refreshing = refreshing || authPost('/token?grant_type=refresh_token', { refresh_token: s.refresh_token })
+    .then(n => { session.set(n); return n.access_token; })
+    .catch(e => { if (!/無法連線/.test(e.message)) session.clear(); throw e; })
+    .finally(() => { refreshing = null; });
+  try { return await refreshing; } catch (e) { if (/無法連線/.test(e.message)) throw e; return null; }
+}
+
+// path keeps the old "/api/..." form; it maps onto the Edge Function.
+async function api(path, body) {
+  const token = await accessToken();
+  if (!token && path !== '/api/me') throw new AuthError();
+  let res;
+  try {
+    res = await fetch(FN + path.replace(/^\/api/, ''), {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { apikey: CFG.publishableKey, ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch { throw new Error('無法連線到伺服器，請確認網路後再試。'); }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) { session.clear(); throw new AuthError(); }
+  if (res.status === 403 && data.pending) throw new PendingError();
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
@@ -53,6 +113,12 @@ async function route() {
   const params = new URLSearchParams(query || '');
   const parts = path.split('/').filter(Boolean);
   try {
+    if (!session.get()) return loginView();
+    if (!ME || !ME.approved) {
+      ME = await api('/api/me');
+      if (!ME.authed) { session.clear(); return loginView(); }
+      if (!ME.approved) return pendingView();
+    }
     if (!META) META = await api('/api/meta');
     if (parts[0] === 'practice') return await practice(parts[1], params);
     if (parts[0] === 'attempt') return await attemptView(Number(parts[1]));
@@ -66,6 +132,7 @@ async function route() {
     return await todayView();
   } catch (e) {
     if (e instanceof AuthError) return loginView();
+    if (e instanceof PendingError) { ME = null; return pendingView(); }
     errorView(e);
   }
 }
@@ -73,22 +140,57 @@ window.addEventListener('hashchange', route);
 window.route = route;
 
 // ---------- login ----------
-function loginView() {
-  setView(`<main class="stack" style="max-width:420px;padding-top:15vh">
+function loginView(mode = 'login', notice = '') {
+  const signup = mode === 'signup';
+  setView(`<main class="stack" style="max-width:420px;padding-top:12vh">
     <h1 style="font-size:2rem">TOEFL Coach</h1>
+    <p class="muted">${signup ? '建立帳號。註冊後需要等管理者核准才能使用。' : '用 Email 登入。'}</p>
+    ${notice ? `<p class="notice">${esc(notice)}</p>` : ''}
     <form id="login">
-      <label class="field"><span>密碼</span><input class="text" type="password" name="pw" autocomplete="current-password" required autofocus></label>
+      <label class="field"><span>Email</span><input class="text" type="email" name="email" autocomplete="email" required autofocus></label>
+      <label class="field"><span>密碼${signup ? '（至少 8 個字元）' : ''}</span>
+        <input class="text" type="password" name="pw" minlength="${signup ? 8 : 1}" autocomplete="${signup ? 'new-password' : 'current-password'}" required></label>
       <p class="error" id="err" hidden></p>
-      <button class="btn block" style="margin-top:16px">登入</button>
-    </form></main>`, { focus: true });
+      <button class="btn block" style="margin-top:16px">${signup ? '註冊' : '登入'}</button>
+    </form>
+    <button class="btn ghost block" id="switch">${signup ? '已經有帳號？登入' : '還沒有帳號？註冊'}</button>
+    </main>`, { focus: true });
+  document.getElementById('switch').onclick = () => loginView(signup ? 'login' : 'signup');
   document.getElementById('login').onsubmit = async ev => {
     ev.preventDefault();
     const err = document.getElementById('err');
+    const btn = ev.target.querySelector('button');
+    const email = ev.target.email.value.trim();
+    const password = ev.target.pw.value;
+    btn.disabled = true; err.hidden = true;
     try {
-      await api('/api/login', { password: ev.target.pw.value });
-      META = null; route();
-    } catch (e) { err.hidden = false; err.textContent = e.message; }
+      const data = signup
+        ? await authPost(`/signup?redirect_to=${encodeURIComponent(location.href.split('#')[0])}`, { email, password })
+        : await authPost('/token?grant_type=password', { email, password });
+      if (!data.access_token) return loginView('login', '已寄出確認信。請點信裡的連結確認 Email，再回來登入。');
+      session.set(data);
+      ME = null; META = null;
+      route();
+    } catch (e) { err.hidden = false; err.textContent = e.message; btn.disabled = false; }
   };
+}
+
+function pendingView() {
+  const email = ME?.email || session.get()?.email || '';
+  setView(`<main class="stack" style="max-width:420px;padding-top:12vh">
+    <h1 style="font-size:2rem">等待核准</h1>
+    <p>帳號 <b>${esc(email)}</b> 已建立，但還沒有被核准。核准之後就能開始練習。</p>
+    <button class="btn block" id="recheck">重新檢查</button>
+    <button class="btn ghost block" id="logout">登出</button></main>`, { focus: true });
+  document.getElementById('recheck').onclick = () => { ME = null; route(); };
+  document.getElementById('logout').onclick = logout;
+}
+
+async function logout() {
+  const s = session.get();
+  session.clear();
+  if (s) authPost('/logout', {}, s.access_token).catch(() => {});
+  loginView();
 }
 
 // ---------- today ----------
@@ -629,6 +731,12 @@ async function vocabQuizRun({ free = false, params = new URLSearchParams() } = {
     if (i >= data.items.length) {
       if (free) return finish();
       data = await api(url); i = 0;
+      if (!data.items.length && data.waitingForCards && data.cardError) {
+        return setView(`${vocabTop(title, prog())}<main class="stack" style="padding-top:8vh">
+          <h2>單字卡還沒準備好</h2><p class="error">${esc(data.cardError)}</p>
+          <p class="muted">${data.waitingForCards} 個字在等單字卡。過幾分鐘會自動重試。</p>
+          <button class="btn block" onclick="route()">重試</button><a class="btn ghost block" href="#/">回到今天</a></main>`, { focus: true });
+      }
       if (!data.items.length && data.waitingForCards) {
         setView(`${vocabTop(title, prog())}${loading(`題目準備中（${data.waitingForCards} 個）`)}`, { focus: true });
         setTimeout(() => next().catch(errorView), 3000);
@@ -787,7 +895,8 @@ async function progressView() {
 // ---------- Settings ----------
 async function settingsView() {
   setView(loading(), { tab: 'settings' });
-  const { plan, vocabSettings: vs } = await api('/api/today');
+  const [{ plan, vocabSettings: vs }, me] = await Promise.all([api('/api/today'), api('/api/me')]);
+  ME = me;
   const s = plan.settings;
   setView(`<main class="stack"><h2>設定</h2>
     <form id="settings">
@@ -800,6 +909,9 @@ async function settingsView() {
       <button class="btn block" style="margin-top:20px">儲存</button>
       <p class="muted small" id="saved" hidden>已儲存，今天的任務已重新安排。</p>
     </form>
+    <h2>帳號</h2>
+    <p>${esc(ME?.email || '')}</p>
+    ${ME?.usage ? `<p class="muted small">今天已用 AI ${ME.usage.used} / ${ME.usage.limit} 次（出題、批改、單字卡各算一次，台灣時間午夜重置）</p>` : ''}
     <button class="btn ghost block" id="logout">登出</button></main>`, { tab: 'settings' });
   document.getElementById('settings').onsubmit = async ev => {
     ev.preventDefault();
@@ -807,9 +919,16 @@ async function settingsView() {
     await api('/api/settings', { examDate: f.examDate.value, target: Number(f.target.value), minutesWeekday: Number(f.minutesWeekday.value), minutesWeekend: Number(f.minutesWeekend.value), vocabNewPerDay: Number(f.vocabNewPerDay.value) });
     document.getElementById('saved').hidden = false;
   };
-  document.getElementById('logout').onclick = async () => { await api('/api/logout', {}); loginView(); };
+  document.getElementById('logout').onclick = logout;
 }
 
 // ---------- boot ----------
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+// Coming back from an email confirmation link: the session arrives in the URL hash.
+if (/access_token=/.test(location.hash)) {
+  const p = new URLSearchParams(location.hash.slice(1));
+  session.set({ access_token: p.get('access_token'), refresh_token: p.get('refresh_token'),
+    expires_at: Number(p.get('expires_at')) || Math.floor(Date.now() / 1000) + Number(p.get('expires_in') || 3600) });
+  history.replaceState(null, '', location.pathname + location.search + '#/');
+}
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 route();

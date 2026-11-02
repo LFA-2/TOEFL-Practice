@@ -211,6 +211,7 @@ label.field { display: block; margin-top: 14px; }
 label.field span { display: block; font-size: .9rem; color: var(--graphite); margin-bottom: 4px; }
 input.text { width: 100%; min-height: 48px; padding: 0 12px; border: 1px solid var(--rule); border-radius: var(--radius-s); background: var(--card); }
 .error { color: var(--red); margin-top: 10px; }
+.notice { border-left: 3px solid var(--ok); padding: 8px 12px; background: var(--bubble); }
 
 /* ---------- Nav ---------- */
 nav.tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; background: var(--card); border-top: 1px solid var(--rule);

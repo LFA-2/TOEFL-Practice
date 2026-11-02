@@ -123,4 +123,4 @@ function publicContent(type, content) {
   return content; // email / disc have no hidden answers
 }
 
-module.exports = { TASKS, SECTIONS, buildCtw, scoreObjective, publicContent };
+export { TASKS, SECTIONS, buildCtw, scoreObjective, publicContent };

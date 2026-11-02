@@ -1,27 +1,28 @@
 // Per-task ability estimates on the TOEFL 1-6 band scale.
-const { db } = require('./db');
-const { TASKS, SECTIONS } = require('./tasks');
-const { today } = require('./time');
+import { TASKS, SECTIONS } from './tasks.js';
+import { today } from './time.js';
 
-const START_RATING = 4.0; // ~TOEIC 800s; the diagnostic corrects it quickly
+export const START_RATING = 4.0; // ~TOEIC 800s; the diagnostic corrects it quickly
 
-function getSkill(type) {
-  return db.prepare('SELECT * FROM skills WHERE type = ?').get(type) || { type, rating: START_RATING, n: 0 };
+export async function allSkills(db) {
+  const rows = await db.q('select type, rating, n from public.skills');
+  const by = Object.fromEntries(rows.map(r => [r.type, r]));
+  return Object.keys(TASKS).map(type => by[type] || { type, rating: START_RATING, n: 0 });
 }
 
-function allSkills() {
-  return Object.keys(TASKS).map(getSkill);
+export async function getSkill(db, type) {
+  return (await db.one('select type, rating, n from public.skills where type = $1', [type])) || { type, rating: START_RATING, n: 0 };
 }
 
 // Probability of answering an item of `difficulty` correctly at `rating`.
-function expected(rating, difficulty) {
+export function expected(rating, difficulty) {
   return 1 / (1 + Math.exp(-1.6 * (rating - difficulty)));
 }
 
 // Objective tasks: Elo-style update toward observed proportion correct.
 // AI-graded tasks: the 0-5 score maps to band (score + 1), and we move toward it.
-function update(type, difficulty, outcome) {
-  const s = getSkill(type);
+export async function update(db, type, difficulty, outcome) {
+  const s = await getSkill(db, type);
   let rating;
   if (TASKS[type].ai) {
     const observedBand = 1 + outcome.raw;           // raw is 0..5
@@ -32,10 +33,12 @@ function update(type, difficulty, outcome) {
     rating = s.rating + k * (outcome.score - expected(s.rating, difficulty));
   }
   rating = Math.min(6, Math.max(1, rating));
-  db.prepare(`INSERT INTO skills(type, rating, n, updated_at) VALUES(?, ?, 1, datetime('now'))
-              ON CONFLICT(type) DO UPDATE SET rating = excluded.rating, n = skills.n + 1, updated_at = excluded.updated_at`)
-    .run(type, rating);
-  db.prepare('INSERT INTO skill_history(type, rating, day) VALUES(?, ?, ?)').run(type, rating, today());
+  await db.tx(async t => {
+    await t.q(`insert into public.skills (type, rating, n, updated_at) values ($1, $2::float8, 1, now())
+               on conflict (user_id, type) do update set rating = excluded.rating, n = public.skills.n + 1, updated_at = now()`,
+      [type, rating]);
+    await t.q('insert into public.skill_history (type, rating, day) values ($1, $2::float8, $3)', [type, rating, today()]);
+  });
   return rating;
 }
 
@@ -44,8 +47,8 @@ const roundHalf = x => Math.round(x * 2) / 2;
 // Section estimates weight each task type by how many points it carries on the real test.
 const WEIGHTS = { ctw: 30, rdl: 10, acad: 10, bas: 10, email: 5, disc: 5 };
 
-function estimates() {
-  const skills = Object.fromEntries(allSkills().map(s => [s.type, s]));
+export async function estimates(db) {
+  const skills = Object.fromEntries((await allSkills(db)).map(s => [s.type, s]));
   const sections = {};
   for (const [name, sec] of Object.entries(SECTIONS)) {
     const measured = sec.types.filter(t => skills[t].n > 0);
@@ -58,5 +61,3 @@ function estimates() {
   const overall = known.length ? roundHalf(known.reduce((a, s) => a + s.exact, 0) / known.length) : null;
   return { skills, sections, overall };
 }
-
-module.exports = { getSkill, allSkills, update, estimates, expected, START_RATING };

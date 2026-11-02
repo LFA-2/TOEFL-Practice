@@ -1,20 +1,22 @@
 // Claude API calls: item generation and grading of written responses.
-const config = require('./config');
-const { buildCtw } = require('./tasks');
-const mock = require('./ai-mock');
+// Runs only inside the Edge Function: the API key never reaches the browser.
+import { buildCtw } from './tasks.js';
+import { respond as mockRespond } from './ai-mock.js';
+import { AiError } from './errors.js';
 
 const CEFR = { 1: 'A1', 2: 'A2', 3: 'B1', 4: 'B2', 5: 'C1', 6: 'C2' };
 const cefrFor = band => CEFR[Math.min(6, Math.max(1, Math.round(band)))];
-
-class AiError extends Error {}
 
 // Structured output: the API is forced to call a "submit" tool, so the result arrives as an
 // already-parsed object instead of JSON text the model might mistype (a missing comma etc.).
 const GENERIC_SCHEMA = { type: 'object', additionalProperties: true };
 
+// Filled in by makeAi(): { anthropicKey, model, vocabModel, apiBase, aiMock }
+const config = { anthropicKey: '', model: 'claude-sonnet-5-5', vocabModel: 'claude-haiku-5-5', apiBase: 'https://api.anthropic.com', aiMock: false };
+
 async function callClaudeJson({ system, prompt, maxTokens = 2500, model = config.model, schema = GENERIC_SCHEMA }) {
-  if (config.aiMock) return parseJson(await mock.respond(system, prompt));
-  if (!config.anthropicKey) throw new AiError('尚未設定 ANTHROPIC_API_KEY，請在 .env 裡加上 API key。');
+  if (config.aiMock) return parseJson(await mockRespond(system, prompt));
+  if (!config.anthropicKey) throw new AiError('伺服器尚未設定 ANTHROPIC_API_KEY（Supabase secrets）。');
   const res = await fetch(`${config.apiBase}/v1/messages`, {
     method: 'POST',
     headers: {
@@ -34,6 +36,10 @@ async function callClaudeJson({ system, prompt, maxTokens = 2500, model = config
   });
   if (!res.ok) {
     const body = await res.text();
+    if (/credit balance/i.test(body)) throw new AiError('Claude API 餘額不足（credit balance），請到 Anthropic Console 儲值');
+    if (res.status === 401) throw new AiError('Claude API key 無效（401），請檢查 ANTHROPIC_API_KEY');
+    if (res.status === 529 || res.status === 503) throw new AiError(`Claude 伺服器忙碌中（${res.status}）`);
+    if (res.status === 429) throw new AiError('Claude API 請求太頻繁（429）');
     throw new AiError(`Claude API ${res.status}: ${body.slice(0, 300)}`);
   }
   const data = await res.json();
@@ -60,7 +66,9 @@ function parseJson(text) {
   }
 }
 
-async function askJson(opts, validate) {
+// `charge` counts one call against the user's daily quota (throws when the quota is used up).
+async function askJson(opts, validate, charge) {
+  if (charge) await charge();
   let lastErr;
   for (let i = 0; i < 3; i++) {
     try {
@@ -152,9 +160,9 @@ JSON: {"course": string, "professor": string, "students": [{"name": string, "pos
 };
 
 // Returns an array of item contents (bas returns several at once).
-async function generate(type, band) {
+async function generate(type, band, charge) {
   const g = GEN[type](band);
-  const obj = await askJson({ system: GEN_SYSTEM, prompt: g.prompt, maxTokens: 3000 }, g.validate);
+  const obj = await askJson({ system: GEN_SYSTEM, prompt: g.prompt, maxTokens: 3000 }, g.validate, charge);
   const built = g.build(obj);
   return Array.isArray(built) ? built : [built];
 }
@@ -208,12 +216,12 @@ ${text}
 ${GRADE_SCHEMA}`;
 }
 
-async function grade(type, content, text, seconds) {
+async function grade(type, content, text, seconds, charge) {
   if (!text.trim()) {
     return { score: 0, summary_zh: '沒有作答內容。', strengths_zh: [], corrections: [], upgrade: [], model_answer: '', next_focus_zh: '' };
   }
   return askJson({ system: GRADE_SYSTEM, prompt: gradePrompt(type, content, text, seconds), maxTokens: 3000 },
-    o => must(typeof o.score === 'number' && o.score >= 0 && o.score <= 5, 'score'));
+    o => must(typeof o.score === 'number' && o.score >= 0 && o.score <= 5, 'score'), charge);
 }
 
 // ---------------- Vocabulary ----------------
@@ -223,7 +231,7 @@ Return ONLY one JSON object, no markdown fences, no commentary.`;
 
 const VOCAB_TOPICS = 'biology, geology and earth science, astronomy, environmental science, psychology, sociology, economics, history and archaeology, anthropology, art and architecture, linguistics, technology, campus life, and verbs/adjectives used in academic argument';
 
-async function vocabCandidates(band, avoid, count = 80) {
+async function vocabCandidates(band, avoid, charge, count = 80) {
   const prompt = `List ${count} different English words worth learning for the TOEFL iBT, at about CEFR ${cefrFor(band)}${band % 1 ? '+' : ''} difficulty.
 - Mix: roughly half general academic vocabulary (Academic Word List style), the rest topic words spread across: ${VOCAB_TOPICS}.
 - Single words only, base/dictionary form, lowercase. No phrases, no proper nouns, no British-only spellings.
@@ -233,7 +241,7 @@ JSON: {"words": [{"w": string, "topic": string}]}`;
   const schema = { type: 'object', required: ['words'], properties: { words: { type: 'array',
     items: { type: 'object', required: ['w'], properties: { w: { type: 'string' }, topic: { type: 'string' } } } } } };
   const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 4000, model: config.vocabModel, schema },
-    o => must(Array.isArray(o.words) && o.words.length >= 10, 'words'));
+    o => must(Array.isArray(o.words) && o.words.length >= 10, 'words'), charge);
   return out.words
     .map(x => ({ w: String(x.w || '').trim().toLowerCase(), topic: String(x.topic || '').slice(0, 40) }))
     .filter(x => /^[a-z]+$/.test(x.w) && x.w.length >= 3);
@@ -265,7 +273,7 @@ function cleanQuiz(q) {
   };
 }
 
-async function vocabCards(words) {
+async function vocabCards(words, charge) {
   const prompt = `Write a study card for each word: ${words.join(', ')}
 For each word:
 - "pos": part of speech abbreviation (n. / v. / adj. / adv.); if several, the one most common in academic English
@@ -284,7 +292,7 @@ JSON: {"cards": [{"w", "pos", "zh", "example", "example_zh", "collocations", "fa
       family: { type: 'array', items: { type: 'object', properties: { w: STR, pos: STR } } },
       quiz: QUIZ_SCHEMA } } } } };
   const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 800 + 520 * words.length, model: config.vocabModel, schema },
-    o => must(Array.isArray(o.cards) && o.cards.length >= 1, 'cards'));
+    o => must(Array.isArray(o.cards) && o.cards.length >= 1, 'cards'), charge);
   return out.cards.map(c => {
     const w = String(c.w || '').toLowerCase();
     const { quiz, ...card } = c;
@@ -293,7 +301,7 @@ JSON: {"cards": [{"w", "pos", "zh", "example", "example_zh", "collocations", "fa
 }
 
 // Quiz questions for words that already have a card (cards made before quizzes existed, or a bad quiz).
-async function vocabQuizzes(items) {
+async function vocabQuizzes(items, charge) {
   const prompt = `For each word below, write a quiz question. The meaning given is the one to test.
 ${items.map(i => `- ${i.word} (${i.pos || ''} ${i.zh || ''})`).join('\n')}
 For each word:
@@ -302,7 +310,7 @@ JSON: {"quizzes": [{"w": string, "quiz": {"sentence", "distractors": [{"w", "why
   const schema = { type: 'object', required: ['quizzes'], properties: { quizzes: { type: 'array',
     items: { type: 'object', required: ['w', 'quiz'], properties: { w: STR, quiz: QUIZ_SCHEMA } } } } };
   const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 600 + 320 * items.length, model: config.vocabModel, schema },
-    o => must(Array.isArray(o.quizzes) && o.quizzes.length >= 1, 'quizzes'));
+    o => must(Array.isArray(o.quizzes) && o.quizzes.length >= 1, 'quizzes'), charge);
   const res = new Map();
   for (const q of out.quizzes) {
     const w = String(q.w || '').toLowerCase();
@@ -311,4 +319,9 @@ JSON: {"quizzes": [{"w": string, "quiz": {"sentence", "distractors": [{"w", "why
   return res;
 }
 
-module.exports = { generate, grade, vocabCandidates, vocabCards, vocabQuizzes, AiError, cefrFor };
+export function makeAi(env) {
+  Object.assign(config, env);
+  return { generate, grade, vocabCandidates, vocabCards, vocabQuizzes };
+}
+
+export { AiError, cefrFor };
