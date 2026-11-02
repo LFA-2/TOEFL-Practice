@@ -17,11 +17,13 @@
 
 ## 第一次部署
 
-需要：Supabase 專案（已建立：`sfgsxkglfqyulxyryxtw`）、一台有 Node.js 的電腦（工作站即可，只有部署時用到）。
+需要：Supabase 專案（東京 `ap-northeast-1`，ref：`kubztmahbfpynoskcysd`）、一台有 Node.js 的電腦（工作站即可，只有部署時用到）。
+
+舊專案在愛爾蘭（`eu-west-1`，ref：`sfgsxkglfqyulxyryxtw`），已暫停並保留，不要刪除、不要再部署上去。
 
 ### 1. Supabase 後台設定
 
-到 <https://supabase.com/dashboard/project/sfgsxkglfqyulxyryxtw>：
+到 <https://supabase.com/dashboard/project/kubztmahbfpynoskcysd>：
 
 1. **Authentication → Sign In / Providers → Email**
    - 關閉 **Confirm email**。Supabase 內建的寄信服務只會寄給專案成員，其他人收不到確認信；註冊改由你手動核准把關。
@@ -37,8 +39,8 @@ git clone -b supabase https://github.com/LFA-2/TOEFL-Practice.git ~/toefl-supaba
 cd ~/toefl-supabase
 
 npx supabase login                                     # 會開瀏覽器登入 Supabase
-npx supabase link --project-ref sfgsxkglfqyulxyryxtw   # 會問資料庫密碼（建立專案時設的）
-npx supabase db push                                   # 建立資料表、RLS、題庫起始題目
+npx supabase link --project-ref kubztmahbfpynoskcysd   # 會問資料庫密碼（建立專案時設的）
+npx supabase db push --remote                         # 建立資料表、RLS、題庫起始題目
 
 npx supabase secrets set ANTHROPIC_API_KEY=sk-ant-...  # 你的 Claude API key，只存在 Supabase
 npx supabase functions deploy api --no-verify-jwt
@@ -97,7 +99,7 @@ sudo tailscale serve reset
 
 - **只改前端（`public/`）**：推上 GitHub，Actions 會自動發佈。
 - **改了 Edge Function**：`npx supabase functions deploy api --no-verify-jwt`
-- **加了 migration**：`npx supabase db push`
+- **加了 migration**：`npx supabase db push --remote`
 
 ## 功能
 
