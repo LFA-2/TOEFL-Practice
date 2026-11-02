@@ -24,7 +24,7 @@ export function expected(rating, difficulty) {
 export async function update(db, type, difficulty, outcome) {
   const s = await getSkill(db, type);
   let rating;
-  if (TASKS[type].ai) {
+  if (TASKS[type].max5) {
     const observedBand = 1 + outcome.raw;           // raw is 0..5
     const alpha = Math.max(0.3, 1 / (s.n + 1));
     rating = s.rating + alpha * (observedBand - s.rating);
@@ -45,7 +45,8 @@ export async function update(db, type, difficulty, outcome) {
 const roundHalf = x => Math.round(x * 2) / 2;
 
 // Section estimates weight each task type by how many points it carries on the real test.
-const WEIGHTS = { ctw: 30, rdl: 10, acad: 10, bas: 10, email: 5, disc: 5 };
+// Listening: items per type on the 2026 test. Speaking: 7 repeat x 5 points, 4 interview x 5 points.
+const WEIGHTS = { ctw: 30, rdl: 10, acad: 10, lcr: 17, conv: 10, ann: 8, talk: 12, rep: 35, interview: 20, bas: 10, email: 5, disc: 5 };
 
 export async function estimates(db) {
   const skills = Object.fromEntries((await allSkills(db)).map(s => [s.type, s]));
@@ -55,9 +56,10 @@ export async function estimates(db) {
     if (!measured.length) { sections[name] = null; continue; }
     const w = measured.reduce((a, t) => a + WEIGHTS[t], 0);
     const v = measured.reduce((a, t) => a + WEIGHTS[t] * skills[t].rating, 0) / w;
-    sections[name] = { band: roundHalf(v), exact: v };
+    sections[name] = { band: roundHalf(v), exact: v, typed: !!sec.typed };
   }
-  const known = Object.values(sections).filter(Boolean);
+  // Typed speaking is not real speaking, so it stays out of the overall estimate.
+  const known = Object.entries(sections).filter(([name, s]) => s && !SECTIONS[name].typed).map(([, s]) => s);
   const overall = known.length ? roundHalf(known.reduce((a, s) => a + s.exact, 0) / known.length) : null;
-  return { skills, sections, overall };
+  return { skills, sections, overall, overallExcludes: ['speaking'] };
 }

@@ -25,6 +25,17 @@ function respond(system, prompt) {
     const list = prompt.split('\n').filter(l => l.startsWith('- ') && l.includes('(')).map(l => l.slice(2).split(' ')[0]);
     return j({ quizzes: list.map(w => ({ w, quiz: mockQuiz(w) })) });
   }
+  if (system.includes('"Take an Interview"')) {
+    return j({
+      score: 3,
+      summary_zh: '（測試模式）回答切題，但理由和例子不夠具體。',
+      per_question: [1, 2, 3, 4].map(n => ({ comment_zh: `（測試）第 ${n} 題回答切題。`, better: `This is a mock stronger answer for question ${n}.` })),
+      strengths_zh: ['回答都有對到問題'],
+      corrections: [{ original: 'I am agree', revised: 'I agree', why_zh: 'agree 是動詞，不用 be' }],
+      upgrade: [{ original: 'good', better: 'beneficial' }],
+      next_focus_zh: '每個回答加一個具體例子。',
+    });
+  }
   if (system.includes('rater')) {
     return j({
       score: 3.5,
@@ -54,6 +65,34 @@ function respond(system, prompt) {
   }
   if (prompt.includes('"Build a Sentence"')) {
     return j({ items: [1, 2, 3, 4, 5].map(n => ({ speaker: 'Maya', context: `Mock context ${counter}-${n}?`, answer: ['I was', 'wondering', 'when the', 'library closes'], extra: 'does', end: '.', explain_zh: '間接問句不倒裝。' })) });
+  }
+  const mq = (n, k = 4) => Array.from({ length: k }, (_, i) => ({ q: `Mock listening question ${n}-${i + 1}?`, options: ['A one', 'B two', 'C three', 'D four'], answer: i % 4, explain_zh: '（測試）解析' }));
+  if (prompt.includes('"Listen and Choose a Response"')) {
+    return j({ items: [1, 2, 3, 4, 5].map(n => ({ voice: n % 2 ? 'f' : 'm', says: `Do you know when the library closes tonight, number ${counter}-${n}?`,
+      options: ['At nine, I think.', 'Yes, I read it.', 'In the library.', 'It closed a book.'], answer: 0, explain_zh: '問時間，回答時間。' })) });
+  }
+  if (prompt.includes('"Listen to a Conversation"')) {
+    return j({ title: `Mock conversation ${counter}`, speakers: [{ name: 'Lena', role: 'student', voice: 'f' }, { name: 'Mark', role: 'librarian', voice: 'm' }],
+      turns: [['Lena', 'Hi, I need a book that is checked out.'], ['Mark', 'You can place a hold on it.'], ['Lena', 'How long does that take?'], ['Mark', 'Usually about a week.'],
+        ['Lena', 'Okay, I will do that.'], ['Mark', 'Great, it only takes a minute.']].map(([speaker, text]) => ({ speaker, text })), questions: mq(counter, 2) });
+  }
+  if (prompt.includes('"Listen to an Announcement"')) {
+    return j({ title: `Mock announcement ${counter}`, speaker: { role: 'Professor', voice: 'm' },
+      text: 'Good morning, everyone. Before we start, a quick reminder about next week. The lab session on Tuesday is moved to Thursday at the same time, because the building will be closed for repairs. Please bring your lab notebooks and finish the reading before you come. If you cannot attend on Thursday, send me an email by Monday so we can find another time.',
+      questions: mq(counter, 2) });
+  }
+  if (prompt.includes('"Listen to an Academic Talk"')) {
+    return j({ title: `Mock talk ${counter}`, course: 'Biology', voice: 'f', text: 'So, today we will look at how plants respond to light. '.repeat(14), questions: mq(counter, 4) });
+  }
+  if (prompt.includes('"Listen and Repeat"')) {
+    return j({ situation: 'A guide shows new students around the library.', situation_zh: '導覽員帶新生參觀圖書館。', voice: 'f',
+      sentences: ['Welcome to the main library.', 'The front desk is on your left.', 'You can borrow up to ten books at once.', 'Quiet study rooms are on the third floor.',
+        'Please return your books before the end of the semester.', 'If you need help finding a book, ask anyone at the information desk.',
+        'The library stays open until midnight during the two weeks before final exams.'] });
+  }
+  if (prompt.includes('"Take an Interview"')) {
+    return j({ topic: `Study habits ${counter}`, topic_zh: '讀書習慣', voice: 'm', intro: 'Thanks for joining. We are studying how university students plan their study time.',
+      questions: ['Where do you usually study, and why?', 'Do you prefer studying alone or with others? Explain.', 'How would your study habits change if all classes were online?', 'Should universities require students to attend every class? Why or why not?'] });
   }
   if (prompt.includes('"Write an Email"')) {
     return j({ scenario: `Mock email scenario ${counter}.`, to: 'Professor Lee', points: ['Explain the problem', 'Ask for an extension', 'Suggest a new date'] });

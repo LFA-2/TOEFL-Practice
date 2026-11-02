@@ -1,20 +1,79 @@
 // Task-type catalogue for the 2026 TOEFL iBT format, plus objective scoring.
+//   ai:    graded by Claude (costs one AI call per submission)
+//   max5:  scored 0-5 like the real rubric (shown as "x/5"); otherwise right/total
+//   audio: the item is played with text-to-speech in the browser
 
 const TASKS = {
   ctw:   { section: 'reading', name: 'Complete the Words', zh: '單字填空', unitMinutes: 3, sessionSize: 2, ai: false },
   rdl:   { section: 'reading', name: 'Read in Daily Life', zh: '日常閱讀', unitMinutes: 3, sessionSize: 2, ai: false },
   acad:  { section: 'reading', name: 'Read an Academic Passage', zh: '學術文章', unitMinutes: 7, sessionSize: 1, ai: false },
+  lcr:   { section: 'listening', name: 'Listen and Choose a Response', zh: '選擇回應', unitMinutes: 0.6, sessionSize: 5, ai: false, audio: true },
+  conv:  { section: 'listening', name: 'Listen to a Conversation', zh: '聽對話', unitMinutes: 3, sessionSize: 1, ai: false, audio: true },
+  ann:   { section: 'listening', name: 'Listen to an Announcement', zh: '聽公告', unitMinutes: 2, sessionSize: 1, ai: false, audio: true },
+  talk:  { section: 'listening', name: 'Listen to an Academic Talk', zh: '學術講座', unitMinutes: 5, sessionSize: 1, ai: false, audio: true },
+  rep:   { section: 'speaking', name: 'Listen and Repeat', zh: '聽後複述', unitMinutes: 4, sessionSize: 1, ai: false, max5: true, audio: true, typed: true },
+  interview: { section: 'speaking', name: 'Take an Interview', zh: '模擬面試', unitMinutes: 9, sessionSize: 1, ai: true, max5: true, audio: true, typed: true, answerSeconds: 90 },
   bas:   { section: 'writing', name: 'Build a Sentence', zh: '句子重組', unitMinutes: 1, sessionSize: 5, ai: false, timeLimit: 41 },
-  email: { section: 'writing', name: 'Write an Email', zh: '寫電子郵件', unitMinutes: 10, sessionSize: 1, ai: true, timeLimit: 7 * 60 },
-  disc:  { section: 'writing', name: 'Academic Discussion', zh: '學術討論', unitMinutes: 13, sessionSize: 1, ai: true, timeLimit: 10 * 60 },
+  email: { section: 'writing', name: 'Write an Email', zh: '寫電子郵件', unitMinutes: 10, sessionSize: 1, ai: true, max5: true, timeLimit: 7 * 60 },
+  disc:  { section: 'writing', name: 'Academic Discussion', zh: '學術討論', unitMinutes: 13, sessionSize: 1, ai: true, max5: true, timeLimit: 10 * 60 },
 };
 
 const SECTIONS = {
   reading:   { zh: '閱讀', types: ['ctw', 'rdl', 'acad'] },
-  listening: { zh: '聽力', types: [] },
-  speaking:  { zh: '口說', types: [] },
+  listening: { zh: '聽力', types: ['lcr', 'conv', 'ann', 'talk'] },
+  // Typed, not spoken: shown on its own and left out of the overall estimate.
+  speaking:  { zh: '口說', types: ['rep', 'interview'], typed: true },
   writing:   { zh: '寫作', types: ['bas', 'email', 'disc'] },
 };
+
+// Listening sets are multiple choice, scored like the reading sets.
+const MC_TYPES = ['rdl', 'acad', 'lcr', 'conv', 'ann', 'talk'];
+
+// ---------- Listen and Repeat scoring ----------
+// Words are compared without case, punctuation or apostrophes ("dont" = "don't").
+const normWord = w => w.toLowerCase().replace(/[’'`]/g, '').replace(/[^a-z0-9]+/g, '');
+
+function editDistance(a, b) {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...new Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+  }
+  return d[a.length][b.length];
+}
+
+// Marks which words of the target sentence appear, in order, in what was typed (longest common subsequence).
+function matchedWords(target, given) {
+  const L = Array.from({ length: target.length + 1 }, () => new Array(given.length + 1).fill(0));
+  for (let i = target.length - 1; i >= 0; i--) {
+    for (let j = given.length - 1; j >= 0; j--) {
+      L[i][j] = target[i] === given[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    }
+  }
+  const ok = new Array(target.length).fill(false);
+  for (let i = 0, j = 0; i < target.length && j < given.length;) {
+    if (target[i] === given[j]) { ok[i] = true; i++; j++; } else if (L[i + 1][j] >= L[i][j + 1]) i++; else j++;
+  }
+  return ok;
+}
+
+// 0-5 points per sentence from word accuracy; one slip in a long sentence still earns a 4.
+const repPoints = acc => (acc >= 0.97 ? 5 : acc >= 0.85 ? 4 : acc >= 0.7 ? 3 : acc >= 0.5 ? 2 : acc >= 0.25 ? 1 : 0);
+
+function scoreSentence(sentence, typed) {
+  const tokens = sentence.split(/\s+/).filter(Boolean);
+  const target = tokens.map(normWord);
+  const given = String(typed || '').split(/\s+/).map(normWord).filter(Boolean);
+  const keep = target.map(w => w !== ''); // a lone dash or symbol is not a word
+  const t = target.filter((_, i) => keep[i]);
+  const acc = t.length ? Math.max(0, 1 - editDistance(t, given) / t.length) : 1;
+  const okT = matchedWords(t, given);
+  let k = 0;
+  const marks = tokens.map((w, i) => ({ w, ok: keep[i] ? okT[k++] : true }));
+  return { target: sentence, given: String(typed || ''), acc: Math.round(acc * 100) / 100, points: repPoints(acc), marks };
+}
 
 // ---------- Complete the Words ----------
 // First sentence stays intact; afterwards every second word loses its second half,
@@ -68,7 +127,13 @@ function scoreObjective(type, content, response) {
     const correct = detail.filter(d => d.ok).length;
     return { score: correct / detail.length, raw: correct, max: detail.length, detail };
   }
-  if (type === 'rdl' || type === 'acad') {
+  if (type === 'rep') {
+    const typed = Array.isArray(response.answers) ? response.answers : [];
+    const detail = content.sentences.map((s, i) => scoreSentence(s.t, typed[i]));
+    const raw = Math.round((detail.reduce((a, d) => a + d.points, 0) / detail.length) * 2) / 2;
+    return { score: raw / 5, raw, max: 5, detail };
+  }
+  if (MC_TYPES.includes(type)) {
     const picks = Array.isArray(response.answers) ? response.answers : [];
     const detail = content.questions.map((q, i) => ({ ok: picks[i] === q.answer, answer: q.answer, picked: picks[i] ?? null }));
     const correct = detail.filter(d => d.ok).length;
@@ -110,7 +175,8 @@ function lowerLead(s) {
 // Strip answers before sending an item to the browser.
 function publicContent(type, content) {
   if (type === 'ctw') return { tokens: content.tokens };
-  if (type === 'rdl' || type === 'acad') {
+  // Listening scripts have to reach the browser for text-to-speech; the page shows them only after answering.
+  if (MC_TYPES.includes(type)) {
     const { questions, ...rest } = content;
     return { ...rest, questions: questions.map(q => ({ q: q.q, options: q.options })) };
   }
@@ -128,7 +194,7 @@ function publicContent(type, content) {
     }
     return { context: content.context, speaker: content.speaker, template, chunks, end: content.end || '.' };
   }
-  return content; // email / disc have no hidden answers
+  return content; // email / disc / rep / interview have no hidden answers
 }
 
-export { TASKS, SECTIONS, buildCtw, scoreObjective, publicContent };
+export { TASKS, SECTIONS, MC_TYPES, buildCtw, scoreObjective, publicContent, scoreSentence };

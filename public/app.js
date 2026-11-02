@@ -5,6 +5,7 @@ const $app = document.getElementById('app');
 const $tabs = document.getElementById('tabs');
 let META = null;
 let timerHandle = null;
+let answerTimer = null; // per-question countdown in the interview
 
 // ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -94,6 +95,8 @@ async function api(path, body) {
 
 function setView(html, { focus = false, tab = null } = {}) {
   clearInterval(timerHandle);
+  clearInterval(answerTimer);
+  Speech.stop(); // leaving a page stops any listening audio
   document.body.classList.toggle('focus', focus);
   $tabs.hidden = focus;
   for (const a of $tabs.querySelectorAll('a')) a.classList.toggle('on', a.dataset.tab === tab);
@@ -201,7 +204,7 @@ function bandsRow(est, target) {
   const sec = est.sections;
   const cell = (k, v, cls = '') => `<div class="${cls}"><span class="v ${v == null ? 'none' : ''}">${fmtBand(v)}</span><span class="k">${k}</span></div>`;
   return `<div class="bands">
-    ${cell('閱讀', sec.reading?.band)}${cell('聽力', sec.listening?.band)}${cell('口說', sec.speaking?.band)}${cell('寫作', sec.writing?.band)}
+    ${cell('閱讀', sec.reading?.band)}${cell('聽力', sec.listening?.band)}${cell('口說*', sec.speaking?.band, 'typed')}${cell('寫作', sec.writing?.band)}
     ${cell('總分', est.overall, 'overall')}
   </div>`;
 }
@@ -247,7 +250,7 @@ async function todayView() {
     <div class="stack">${intro}
       <div class="sheet">${vocabRows}${tasks}</div>
       ${allDone ? '<p>今天的任務都完成了。想多練可以到「進度」挑一個題型。</p>' : ''}
-      <p class="muted small">單字最多佔每天時間的一半，其餘給閱讀與寫作。聽力與口說（打字版）會在下一版加入。</p>
+      <p class="muted small">單字最多佔每天時間的一半，其餘依弱項分給閱讀、聽力、口說和寫作。＊口說是打字版，分數另外顯示，不算進總分。聽力和口說用瀏覽器內建語音播放，請開聲音。</p>
     </div></main>`, { tab: 'today' });
 }
 
@@ -268,7 +271,8 @@ async function nextInSession(session) {
   session.exclude.push(item.id);
   session.item = item;
   session.started = Date.now();
-  const render = { ctw: renderCtw, rdl: renderMc, acad: renderMc, bas: renderBas, email: renderWriting, disc: renderWriting }[type];
+  const render = { ctw: renderCtw, rdl: renderMc, acad: renderMc, lcr: renderListen, conv: renderListen, ann: renderListen, talk: renderListen,
+    rep: renderRep, interview: renderInterview, bas: renderBas, email: renderWriting, disc: renderWriting }[type];
   render(session);
   startTimer(session);
 }
@@ -425,7 +429,7 @@ function renderMc(session) {
 }
 
 function mcResultMarkup(c, detail) {
-  return detail.map((d, qi) => `<div class="q"><div class="stem">${qi + 1}. ${esc(d.q)}</div>
+  return detail.map((d, qi) => `<div class="q"><div class="stem">${d.q ? `${detail.length > 1 ? `${qi + 1}. ` : ''}${esc(d.q)}` : '選出最適合的回應。'}</div>
     ${d.options.map((o, oi) => {
       const cls = oi === d.answer ? 'correct' : (oi === d.picked ? 'missed' : '');
       return `<div class="opt ${cls}"><span class="letter">${LETTERS[oi]}</span><span>${esc(o)}</span></div>`;
@@ -469,6 +473,355 @@ function renderBas(session) {
   });
   draw();
   submit.onclick = e => submitSession(session, { order: template.map((t, i) => (t.blank ? c.chunks[filled.get(i)] : t.t)) }, e.currentTarget);
+}
+
+// ---------- Speech: the browser's built-in text-to-speech ----------
+// Lines are split into sentences before speaking: Chrome stops long utterances after about 15 seconds.
+const Speech = {
+  voices: [],
+  loaded: null,
+  token: 0,
+  supported: typeof window !== 'undefined' && 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined',
+  load() {
+    if (this.loaded) return this.loaded;
+    this.loaded = new Promise(resolve => {
+      if (!this.supported) return resolve([]);
+      const got = () => {
+        const v = speechSynthesis.getVoices().filter(x => /^en[-_]/i.test(x.lang));
+        if (v.length) { this.voices = v; resolve(v); }
+      };
+      got();
+      speechSynthesis.addEventListener?.('voiceschanged', got);
+      setTimeout(() => resolve(this.voices), 2500); // some browsers never fire voiceschanged
+    });
+    return this.loaded;
+  },
+  // A female and a male US voice where the device has them; otherwise one voice at two pitches.
+  voiceFor(g) {
+    const us = this.voices.filter(v => /en[-_]US/i.test(v.lang));
+    const pool = us.length ? us : this.voices;
+    const female = /samantha|zira|aria|jenny|ava|allison|susan|karen|victoria|emma|michelle|salli|joanna|female|google us english/i;
+    const male = /alex|david|guy|daniel|fred|tom|aaron|christopher|eric|matthew|mark|andrew|brian|male/i;
+    const f = pool.find(v => female.test(v.name) && !/\bmale\b/i.test(v.name)) || pool[0];
+    const m = pool.find(v => male.test(v.name) && !female.test(v.name)) || this.voices.find(v => v !== f && /en[-_](GB|AU|CA)/i.test(v.lang));
+    if (g === 'm') return m ? { voice: m, pitch: 1 } : { voice: f, pitch: 0.75 };
+    return { voice: f, pitch: m ? 1 : 1.15 };
+  },
+  stop() {
+    this.token++;
+    try { if (this.supported) speechSynthesis.cancel(); } catch { /* not available */ }
+  },
+  // Plays script lines [{v, t}] in order. Resolves true when finished, false when stopped.
+  async play(lines, { rate = 1, onLine } = {}) {
+    await this.load();
+    this.stop();
+    const my = this.token;
+    if (!this.voices.length) return false;
+    for (let i = 0; i < lines.length; i++) {
+      if (my !== this.token) return false;
+      onLine?.(i);
+      const { voice, pitch } = this.voiceFor(lines[i].v);
+      for (const part of String(lines[i].t).split(/(?<=[.!?])\s+/).filter(Boolean)) {
+        if (my !== this.token) return false;
+        await new Promise(resolve => {
+          const u = new SpeechSynthesisUtterance(part);
+          try { u.voice = voice; } catch { /* keep the default voice */ }
+          u.lang = voice?.lang || 'en-US'; u.pitch = pitch; u.rate = 0.95 * rate;
+          u.onend = u.onerror = () => resolve();
+          speechSynthesis.speak(u);
+        });
+      }
+      if (i < lines.length - 1) await new Promise(r => setTimeout(r, 450)); // a short pause between speakers
+    }
+    return my === this.token;
+  },
+};
+
+const NO_VOICE_MSG = '這個瀏覽器沒有可用的英文語音，所以聽不到聲音。可以換 Chrome、Edge 或 Safari，或在系統設定加裝英文語音。也可以先看文字作答，這次會記錄成「沒有聲音」。';
+
+// A play / replay button with a speed choice. In the diagnostic (exam rules) it plays only once.
+// opts: { once, onStart, onEnd, label }
+function playerMarkup(id = 'player') {
+  return `<div class="player" id="${id}">
+    <button class="btn" data-act="play">▶ 播放</button>
+    <div class="speed" role="group" aria-label="播放速度"><button data-r="0.9">0.9×</button><button data-r="1" class="on">1.0×</button></div>
+    <span class="muted small pstate" aria-live="polite">還沒播放</span></div>`;
+}
+
+function wirePlayer(root, lines, { once = false, onStart, onEnd, label = '播放' } = {}) {
+  const btn = root.querySelector('[data-act="play"]');
+  const state = root.querySelector('.pstate');
+  let rate = 1; let plays = 0; let playing = false;
+  btn.textContent = `▶ ${label}`;
+  root.querySelectorAll('.speed button').forEach(b => b.onclick = () => {
+    rate = Number(b.dataset.r);
+    root.querySelectorAll('.speed button').forEach(x => x.classList.toggle('on', x === b));
+  });
+  const ctl = {
+    get plays() { return plays; },
+    async start() {
+      if (playing) { Speech.stop(); return; }
+      if (once && plays >= 1) return;
+      await Speech.load();
+      if (!Speech.voices.length) { state.textContent = NO_VOICE_MSG; onEnd?.({ noVoice: true }); return; }
+      plays++; playing = true;
+      onStart?.(plays);
+      btn.textContent = '■ 停止';
+      const ok = await Speech.play(lines, { rate, onLine: i => { state.textContent = lines.length > 1 ? `播放中…（${i + 1} / ${lines.length}）` : '播放中…'; } });
+      playing = false;
+      if (!root.isConnected) return;
+      if (once) { btn.disabled = true; btn.textContent = '已播放'; state.textContent = '正式考試只能聽一次。'; } else {
+        btn.textContent = '↻ 重聽'; state.textContent = plays > 1 ? `已聽 ${plays} 次` : '播完了，需要可以重聽（會記錄次數）';
+      }
+      onEnd?.({ finished: ok });
+    },
+  };
+  btn.onclick = () => ctl.start();
+  return ctl;
+}
+
+// ---------- Listening (choose a response / conversation / announcement / talk) ----------
+const LISTEN = ['lcr', 'conv', 'ann', 'talk'];
+
+function listenIntro(type, c) {
+  if (type === 'lcr') return '你會聽到一句話。聽完後選出最自然的回應。';
+  if (type === 'conv') {
+    const who = asList(c.speakers).map(s => `${esc(s.name)}${s.role ? `（${esc(s.role)}）` : ''}`).join('和');
+    return `你會聽到${who || '兩個人'}的對話。聽完後回答問題。`;
+  }
+  if (type === 'ann') return `你會聽到一段${c.role ? `${esc(c.role)}的` : ''}公告。聽完後回答問題。`;
+  return `你會聽到一段${c.course ? `${esc(c.course)}課的` : ''}講課。聽完後回答問題，可以邊聽邊做筆記。`;
+}
+
+function transcriptMarkup(c) {
+  const lines = asList(c.script);
+  return `<details class="transcript" open><summary>逐字稿</summary>
+    ${lines.map(l => `<p>${lines.length > 1 || l.s ? `<b>${esc(l.s || '')}</b> ` : ''}${esc(l.t)}</p>`).join('')}</details>`;
+}
+
+function renderListen(session) {
+  const c = session.item.content;
+  const once = session.mode === 'diagnostic';
+  const picks = new Array(c.questions.length).fill(null);
+  let noAudio = false;
+  const stem = (q, qi) => (q.q ? `${c.questions.length > 1 ? `${qi + 1}. ` : ''}${esc(q.q)}` : '選出最適合的回應。');
+  const qs = c.questions.map((q, qi) => `<div class="q"><div class="stem">${stem(q, qi)}</div>
+    ${q.options.map((o, oi) => `<button class="opt" data-q="${qi}" data-o="${oi}"><span class="letter">${LETTERS[oi]}</span><span>${esc(o)}</span></button>`).join('')}</div>`).join('');
+  setView(`${topBar(session)}<main>
+    <p class="muted small">${listenIntro(session.type, c)}${once ? '（診斷：跟正式考試一樣只能聽一次）' : ''}</p>
+    ${c.title && session.type !== 'lcr' ? `<p class="passage-title">${esc(c.title)}</p>` : ''}
+    ${playerMarkup()}
+    <p class="muted small" id="qhint">題目會在聽完之後出現。</p>
+    <div id="qs" hidden>${qs}</div>
+    <div id="noaudio"></div>
+    <button class="btn block" id="submit" style="margin-top:24px" disabled hidden>送出</button></main>`, { focus: true });
+  const submit = document.getElementById('submit');
+  const reveal = () => {
+    document.getElementById('qs').hidden = false; submit.hidden = false;
+    document.getElementById('qhint').hidden = true;
+  };
+  const player = wirePlayer(document.getElementById('player'), c.script, {
+    once,
+    onEnd: r => {
+      if (r.noVoice) {
+        document.getElementById('noaudio').innerHTML = `<button class="btn ghost block" id="showtext">看文字作答</button>`;
+        document.getElementById('showtext').onclick = () => {
+          noAudio = true;
+          document.getElementById('noaudio').innerHTML = `<div class="card passage">${c.script.map(l => `<p>${l.s ? `<b>${esc(l.s)}</b> ` : ''}${esc(l.t)}</p>`).join('')}</div>`;
+          reveal();
+        };
+        return;
+      }
+      reveal();
+    },
+  });
+  $app.querySelectorAll('#qs .opt').forEach(b => b.onclick = () => {
+    const qi = Number(b.dataset.q);
+    picks[qi] = Number(b.dataset.o);
+    $app.querySelectorAll(`.opt[data-q="${qi}"]`).forEach(x => x.classList.toggle('sel', x === b));
+    submit.disabled = picks.some(p => p === null);
+  });
+  submit.onclick = e => { Speech.stop(); submitSession(session, { answers: picks, plays: player.plays, noAudio }, e.currentTarget); };
+}
+
+function listenResult(content, feedback, response) {
+  const plays = response.plays || 0;
+  const note = response.noAudio ? '這次沒有聲音，是看文字作答的。' : plays > 1 ? `這次聽了 ${plays} 次（正式考試只能聽一次）。` : '';
+  return `${note ? `<p class="muted small">${note}</p>` : ''}
+    ${mcResultMarkup(content, feedback.detail)}
+    <div class="card" style="margin-top:16px">${playerMarkup('replay')}${transcriptMarkup(content)}</div>`;
+}
+
+// ---------- Speaking 1: Listen and Repeat (typed) ----------
+function renderRep(session) {
+  const c = session.item.content;
+  const once = session.mode === 'diagnostic';
+  const n = c.sentences.length;
+  const key = `draft:${session.item.id}`;
+  const answers = (() => { try { return JSON.parse(store.get(key) || '[]'); } catch { return []; } })();
+  const plays = new Array(n).fill(0);
+  let i = 0; let noAudio = false;
+  const step = () => {
+    setView(`${topBar(session)}<main>
+      <p class="muted small">${c.situation_zh ? `情境：${esc(c.situation_zh)}<br>` : ''}聽一句，把聽到的句子完整打出來。大小寫和標點不計分。${once ? '每句只能聽一次。' : ''}</p>
+      <div class="repstep"><b>第 ${i + 1} / ${n} 句</b><div class="dots">${c.sentences.map((_, k) => `<i class="${k < i ? 'on' : k === i ? 'cur' : ''}"></i>`).join('')}</div></div>
+      ${playerMarkup()}
+      <div id="noaudio"></div>
+      <textarea id="typed" class="short" rows="3" placeholder="聽完後在這裡打字" autocapitalize="sentences" autocomplete="off" autocorrect="off" spellcheck="false" disabled></textarea>
+      <button class="btn block" id="go" style="margin-top:16px" disabled>${i + 1 < n ? '下一句' : '送出'}</button>
+      <p class="muted small kbd-hint">Enter 到下一句</p></main>`, { focus: true });
+    startTimer(session);
+    const ta = document.getElementById('typed');
+    const go = document.getElementById('go');
+    ta.value = answers[i] || '';
+    const unlock = () => { ta.disabled = false; go.disabled = false; ta.focus(); };
+    const player = wirePlayer(document.getElementById('player'), [c.sentences[i]], {
+      once,
+      onStart: p => { plays[i] = p; },
+      onEnd: r => {
+        if (r.noVoice) {
+          noAudio = true;
+          document.getElementById('noaudio').innerHTML = `<div class="card passage">${esc(c.sentences[i].t)}</div><p class="muted small">沒有語音，先看文字練習打字。</p>`;
+        }
+        unlock();
+      },
+    });
+    if (i > 0) player.start(); // the click on 下一句 lets the browser play right away
+    ta.oninput = () => { answers[i] = ta.value; store.set(key, JSON.stringify(answers)); };
+    ta.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); go.click(); } };
+    go.onclick = e => {
+      answers[i] = ta.value;
+      if (i + 1 < n) { i++; step(); return; }
+      Speech.stop();
+      submitSession(session, { answers: c.sentences.map((_, k) => answers[k] || ''), plays, noAudio }, e.currentTarget);
+    };
+  };
+  step();
+}
+
+function repResult(content, feedback, response) {
+  const plays = asList(response.plays);
+  return `<div class="stack">${asList(feedback.detail).map((d, k) => `<div class="card rep">
+      <div class="row"><b class="spacer">第 ${k + 1} 句</b><span class="muted small">${plays[k] > 1 ? `聽了 ${plays[k]} 次・` : ''}</span><b>${d.points}<small>/5</small></b></div>
+      <p class="reptarget">${asList(d.marks).map(m => (m.ok ? esc(m.w) : `<mark class="miss">${esc(m.w)}</mark>`)).join(' ')}</p>
+      <p class="muted small">你打的：${d.given ? esc(d.given) : '（空白）'}</p>
+      <button class="link small" data-say="${k}">▶ 再聽一次</button></div>`).join('')}
+    <p class="muted small">標色的字是漏掉或打錯的。每句依正確字數比例給 0–5 分，整組取平均。</p></div>`;
+}
+
+// ---------- Speaking 2: Take an Interview (typed) ----------
+function renderInterview(session) {
+  const c = session.item.content;
+  const once = session.mode === 'diagnostic';
+  const n = c.questions.length;
+  const limit = session.meta.answerSeconds || 90;
+  const key = `draft:${session.item.id}`;
+  const answers = (() => { try { return JSON.parse(store.get(key) || '[]'); } catch { return []; } })();
+  const plays = new Array(n).fill(0);
+  const shown = new Array(n).fill(false);
+  let i = 0; let noAudio = false;
+
+  const intro = () => {
+    setView(`${topBar(session)}<main class="stack">
+      <h2>${esc(c.topic_zh || c.topic || '模擬面試')}</h2>
+      <p>面試官會用語音問 ${n} 個問題。每題聽完後有 <b>${limit} 秒</b>打字回答，時間到就會鎖住。</p>
+      <p class="muted small">正式考試是開口說 45 秒，打字比較慢，所以這裡給 ${limit} 秒，目標每題 60–80 字。題目只用聽的${once ? '，診斷時每題只能聽一次' : '，練習時可以重聽或看文字（會記錄）'}。</p>
+      <button class="btn block" id="begin">開始面試</button></main>`, { focus: true });
+    startTimer(session);
+    document.getElementById('begin').onclick = () => question();
+  };
+
+  const question = () => {
+    const lines = [...(i === 0 && c.intro ? [{ v: c.v, t: c.intro }] : []), { v: c.v, t: c.questions[i] }];
+    setView(`${topBar(session)}<main>
+      <div class="repstep"><b>第 ${i + 1} / ${n} 題</b><span class="answer-clock" id="clock">${fmtTime(limit)}</span></div>
+      ${playerMarkup()}
+      <div id="qtext"></div>
+      <textarea id="ans" placeholder="聽完問題後開始打字" autocapitalize="sentences" spellcheck="false" disabled></textarea>
+      <div class="row"><span class="muted small" id="wc">0 字</span><span class="spacer"></span>
+        ${once ? '' : '<button class="link small" id="showq">看題目文字</button>'}</div>
+      <button class="btn block" id="go" style="margin-top:12px" disabled>${i + 1 < n ? '下一題' : '送出批改'}</button></main>`, { focus: true });
+    startTimer(session);
+    const ta = document.getElementById('ans');
+    const go = document.getElementById('go');
+    const clock = document.getElementById('clock');
+    const wc = document.getElementById('wc');
+    ta.value = answers[i] || '';
+    let started = false;
+    const begin = () => {
+      if (started) return;
+      started = true; ta.disabled = false; go.disabled = false; ta.focus();
+      const t0 = Date.now();
+      clearInterval(answerTimer);
+      answerTimer = setInterval(() => {
+        const left = Math.max(0, limit - (Date.now() - t0) / 1000);
+        if (!clock.isConnected) return clearInterval(answerTimer);
+        clock.textContent = fmtTime(Math.ceil(left));
+        clock.classList.toggle('over', left <= 10);
+        if (left <= 0) {
+          clearInterval(answerTimer);
+          ta.readOnly = true; clock.textContent = '時間到';
+          go.focus();
+        }
+      }, 250);
+    };
+    const showText = () => {
+      document.getElementById('qtext').innerHTML = `<div class="card passage">${lines.map(l => esc(l.t)).join('<br>')}</div>`;
+    };
+    const player = wirePlayer(document.getElementById('player'), lines, {
+      once,
+      onStart: p => { plays[i] = p; },
+      onEnd: r => {
+        if (r.noVoice) { noAudio = true; shown[i] = true; showText(); }
+        begin();
+      },
+    });
+    const showq = document.getElementById('showq');
+    if (showq) showq.onclick = () => { shown[i] = true; showText(); showq.remove(); };
+    player.start(); // started by a click (開始 or 下一題), so the browser allows audio
+    ta.oninput = () => { answers[i] = ta.value; wc.textContent = `${words(ta.value)} 字`; store.set(key, JSON.stringify(answers)); };
+    wc.textContent = `${words(ta.value)} 字`;
+    go.onclick = e => {
+      answers[i] = ta.value;
+      clearInterval(answerTimer);
+      if (i + 1 < n) { i++; question(); return; }
+      Speech.stop();
+      submitSession(session, { answers: c.questions.map((_, k) => answers[k] || ''), plays, shownText: shown, noAudio }, e.currentTarget);
+    };
+  };
+  intro();
+}
+
+function interviewFeedback(fb, content, response) {
+  const list = (v, fn) => { const arr = asList(v); return arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>'; };
+  const answers = asList(response.answers);
+  const per = asList(fb.per_question);
+  const strengths = asList(fb.strengths_zh);
+  const upgrade = asList(fb.upgrade);
+  return `<div class="fb">
+    <p>${esc(fb.summary_zh)}</p>
+    <p class="muted small">打字版只評內容、組織和用字，不含發音與流暢度。</p>
+    ${content.questions.map((q, k) => `<div class="card iq">
+      <p class="small muted">第 ${k + 1} 題</p><p><b>${esc(q)}</b></p>
+      <p class="ianswer">${answers[k] ? esc(answers[k]) : '<span class="muted">（沒有作答）</span>'}</p>
+      <p class="muted small">${words(answers[k] || '')} 字</p>
+      ${per[k]?.comment_zh ? `<div class="explain small">${esc(per[k].comment_zh)}</div>` : ''}
+      ${per[k]?.better ? `<details><summary>更好的回答</summary><div class="passage" style="margin-top:6px">${esc(per[k].better)}</div></details>` : ''}
+    </div>`).join('')}
+    ${strengths.length ? `<h3>做得好的地方</h3><ul>${strengths.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+    <h3>修改</h3>${list(fb.corrections, c => `<li><del>${esc(c.original)}</del><ins>${esc(c.revised)}</ins><span class="why">${esc(c.why_zh)}</span></li>`)}
+    ${upgrade.length ? `<h3>可以換成更自然的說法</h3>${list(upgrade, u => `<li><del>${esc(u.original)}</del><ins>${esc(u.better)}</ins></li>`)}` : ''}
+    ${fb.next_focus_zh ? `<h3>下次練習的重點</h3><p>${esc(fb.next_focus_zh)}</p>` : ''}
+  </div>`;
+}
+
+// Wires the replay buttons on a listening / repeat result page.
+function wireResultAudio(type, content) {
+  const replay = document.getElementById('replay');
+  if (replay && content.script) wirePlayer(replay, content.script, { label: '再聽一次' });
+  if (type === 'rep') {
+    $app.querySelectorAll('[data-say]').forEach(b => b.onclick = () => Speech.play([content.sentences[Number(b.dataset.say)]]));
+  }
 }
 
 // ---------- Writing (email / academic discussion) ----------
@@ -521,7 +874,7 @@ function writingFeedback(fb, text, { openText = false } = {}) {
 
 // ---------- Results ----------
 function verdict(r) {
-  const ai = META.tasks[r.type].ai;
+  const ai = META.tasks[r.type].max5;
   const mark = ai ? `${fmtBand(r.raw)}<small>/5</small>` : `${r.raw}<small>/${r.max}</small>`;
   const note = ai ? `約等於 ${fmtBand(1 + r.raw)} 級` : `${Math.round(r.score * 100)}%`;
   return `<div class="verdict"><span class="mark">${mark}</span><span class="muted">${note}</span></div>`;
@@ -530,6 +883,9 @@ function verdict(r) {
 function resultBody(type, content, feedback, response, given, opts) {
   if (type === 'ctw') return `<div class="card ctw">${ctwMarkup(content.tokens, { result: feedback.detail, given: given || response.blanks || [] })}</div>`;
   if (type === 'rdl' || type === 'acad') return mcPassage(content) + mcResultMarkup(content, feedback.detail);
+  if (LISTEN.includes(type)) return listenResult(content, feedback, response);
+  if (type === 'rep') return repResult(content, feedback, response);
+  if (type === 'interview') return interviewFeedback(feedback, content, response);
   if (type === 'bas') {
     const d = feedback.detail[0];
     return `<div class="speech"><b>${esc(content.speaker || 'A')}</b>${esc(content.context)}</div>
@@ -541,8 +897,9 @@ function resultBody(type, content, feedback, response, given, opts) {
   return writingFeedback(feedback, response.text, opts);
 }
 
-const WRITING = ['email', 'disc'];
-const WLABEL = { email: '信件', disc: '學術討論' }; // short names for the writing record
+// Types in the writing & speaking record (answers graded by Claude), with short names.
+const WRITING = ['email', 'disc', 'interview'];
+const WLABEL = { email: '信件', disc: '學術討論', interview: '面試' };
 
 function showResult(session, r, response) {
   setView(`${topBar(session)}<main>${verdict(r)}${ratingDelta(r)}
@@ -550,6 +907,7 @@ function showResult(session, r, response) {
     ${WRITING.includes(session.type) ? `<p style="margin-top:16px"><a class="link small" href="#/writing?type=${session.type}">看過去的${WLABEL[session.type]}紀錄</a></p>` : ''}
     ${afterResultButtons(session)}</main>`, { focus: true });
   document.getElementById('timer').textContent = '';
+  wireResultAudio(session.type, session.item.content);
   wireNext(session);
 }
 
@@ -559,18 +917,21 @@ async function attemptView(id, params = new URLSearchParams()) {
   const r = { type: a.type, raw: a.raw_score, max: a.max_score, score: a.score };
   const writing = WRITING.includes(a.type);
   const from = params.get('from');
-  const back = from === 'writing' ? `<a class="link" href="#/writing${params.get('t') ? `?type=${encodeURIComponent(params.get('t'))}` : ''}">← 寫作紀錄</a>`
+  const back = from === 'writing' ? `<a class="link" href="#/writing${params.get('t') ? `?type=${encodeURIComponent(params.get('t'))}` : ''}">← 寫作與口說紀錄</a>`
     : '<a class="link" href="#/progress">← 進度</a>';
   setView(`<main><p>${back}</p>
     <h2>${esc(META.tasks[a.type].zh)}</h2><p class="muted small">${esc(a.day)}・${fmtTime(a.seconds || 0)}</p>
-    ${writing ? `<details class="prompt-wrap"><summary>題目</summary>${writingPrompt(a.type, a.item.content)}</details>` : ''}
+    ${a.type === 'email' || a.type === 'disc' ? `<details class="prompt-wrap"><summary>題目</summary>${writingPrompt(a.type, a.item.content)}</details>` : ''}
+    ${a.type === 'rep' && a.item.content.situation_zh ? `<p class="muted small">情境：${esc(a.item.content.situation_zh)}</p>` : ''}
+    ${a.type === 'interview' ? `<p class="muted small">主題：${esc(a.item.content.topic_zh || a.item.content.topic)}</p>` : ''}
     ${verdict(r)}${resultBody(a.type, a.item.content, a.feedback, a.response, undefined, { openText: true })}
     <div class="row" style="margin-top:24px">
       ${writing ? `<a class="btn ghost block" href="#/writing?type=${a.type}">全部紀錄</a>` : ''}
       <a class="btn ghost block" href="#/practice/${a.type}?n=1">再練一題</a></div></main>`, { tab: 'progress' });
+  wireResultAudio(a.type, a.item.content);
 }
 
-// ---------- Writing record (email / academic discussion) ----------
+// ---------- Writing & speaking record (email / academic discussion / interview) ----------
 function writingRow(w, filter) {
   return `<a class="wcard" href="#/attempt/${w.id}?from=writing${filter ? `&t=${filter}` : ''}">
     <div class="row"><span class="wtype">${WLABEL[w.type]}</span>
@@ -589,23 +950,23 @@ async function writingView(params) {
   const stat = t => {
     const s = d.stats[t];
     return `<div><b>${s.n ? fmtBand(s.recentAvg) : '—'}</b><span>${WLABEL[t]}・近 5 次平均</span>
-      <span class="muted small">${s.n ? `共 ${s.n} 篇・最高 ${fmtBand(s.best)}` : '還沒寫過'}</span></div>`;
+      <span class="muted small">${s.n ? `共 ${s.n} ${t === 'interview' ? '次' : '篇'}・最高 ${fmtBand(s.best)}` : '還沒做過'}</span></div>`;
   };
   const shown = filter ? [filter] : WRITING;
   const trends = shown.filter(t => d.stats[t].trend.length > 1)
     .map(t => `<p class="muted small" style="margin-bottom:4px">${WLABEL[t]}分數走勢（換算成 1–6 級分）</p>
       ${sparkline(d.stats[t].trend.map(s => 1 + s), d.target, `${WLABEL[t]}分數走勢`)}`).join('');
-  const seg = [['', '全部'], ['email', WLABEL.email], ['disc', WLABEL.disc]]
+  const seg = [['', '全部'], ...WRITING.map(t => [t, WLABEL[t]])]
     .map(([t, label]) => `<a href="#/writing${t ? `?type=${t}` : ''}" class="${t === filter ? 'on' : ''}"${t === filter ? ' aria-current="page"' : ''}>${esc(label)}</a>`).join('');
   setView(`<main class="stack">
     <p><a class="link" href="#/progress">← 進度</a></p>
-    <h2>寫作紀錄</h2>
-    <div class="wstats">${stat('email')}${stat('disc')}</div>
+    <h2>寫作與口說紀錄</h2>
+    <div class="wstats">${WRITING.map(stat).join('')}</div>
     ${trends}
     <nav class="seg" aria-label="篩選題型">${seg}</nav>
-    <div id="wlist">${d.items.map(w => writingRow(w, filter)).join('') || '<p class="muted">還沒有紀錄。寫完一篇並送出批改後會出現在這裡。</p>'}</div>
+    <div id="wlist">${d.items.map(w => writingRow(w, filter)).join('') || '<p class="muted">還沒有紀錄。完成一次並送出批改後會出現在這裡。</p>'}</div>
     ${d.more ? '<button class="btn ghost block" id="wmore">載入更多</button>' : ''}
-    <div class="row">${shown.map(t => `<a class="btn block" href="#/practice/${t}?n=1">練習${WLABEL[t]}</a>`).join('')}</div>
+    <div class="btn-grid">${shown.map(t => `<a class="btn block" href="#/practice/${t}?n=1">練習${WLABEL[t]}</a>`).join('')}</div>
   </main>`, { tab: 'progress' });
   let next = d.next;
   const more = document.getElementById('wmore');
@@ -934,32 +1295,79 @@ async function progressView() {
   setView(loading(), { tab: 'progress' });
   const d = await api('/api/dashboard');
   const target = d.settings.target;
-  const rows = Object.entries(META.tasks).map(([type, m]) => {
+  const sections = Object.entries(META.sections);
+  const skillRow = type => {
+    const m = META.tasks[type];
     const s = d.estimates.skills[type];
     const pct = s.n ? ((s.rating - 1) / 5) * 100 : 0;
     return `<a class="skill-row" href="#/practice/${type}?n=${m.sessionSize}">
       <div><div><b>${esc(m.zh)}</b></div><div class="muted small">${s.n ? `練過 ${s.n} 次` : '還沒練過'}</div></div>
       <div class="meter"><span style="width:${pct}%"></span><i class="target" style="left:${((target - 1) / 5) * 100}%"></i></div>
       <b>${s.n ? fmtBand(s.rating) : '—'}</b></a>`;
-  }).join('');
+  };
+  const rows = sections.map(([, sec]) => `<h3 class="sec">${esc(sec.zh)}${sec.typed ? '<span class="muted small">（打字版，不算進總分）</span>' : ''}</h3>
+    ${sec.types.map(skillRow).join('')}`).join('');
 
-  // overall trend: replay history, average of latest rating per type that has data
+  // overall trend: replay history, average of latest rating per type that has data (typed speaking left out)
+  const typedTypes = new Set(sections.filter(([, sec]) => sec.typed).flatMap(([, sec]) => sec.types));
   const latest = {}; const trend = [];
-  for (const h of d.history) { latest[h.type] = h.rating; const v = Object.values(latest); trend.push(v.reduce((a, b) => a + b, 0) / v.length); }
+  for (const h of d.history) {
+    if (typedTypes.has(h.type)) continue;
+    latest[h.type] = h.rating; const v = Object.values(latest); trend.push(v.reduce((a, b) => a + b, 0) / v.length);
+  }
 
-  const hist = d.recent.map(a => `<li><a href="#/attempt/${a.id}"><span class="spacer">${esc(META.tasks[a.type].zh)}</span>
-    <span class="muted small">${esc(a.day.slice(5))}</span><b>${META.tasks[a.type].ai ? fmtBand(a.raw_score) + '/5' : `${a.raw_score}/${a.max_score}`}</b></a></li>`).join('');
+  // past practice, grouped by section and task type; each group loads its list when opened
+  const group = type => {
+    const m = META.tasks[type];
+    const c = d.byType?.[type];
+    return `<details class="tgroup" data-type="${type}"><summary><b class="spacer">${esc(m.zh)}</b>
+        <span class="muted small">${c ? `${c.n} 次・最近 ${esc(String(c.last).slice(5))}` : '還沒練過'}</span></summary>
+      <div class="tlist">${c ? '<p class="muted small">載入中…</p>' : '<p class="muted small">還沒有紀錄。</p>'}</div></details>`;
+  };
+  const groups = sections.map(([, sec]) => `<h3 class="sec">${esc(sec.zh)}</h3>${sec.types.map(group).join('')}`).join('');
 
   setView(`<main class="stack">
     <h2>各題型能力</h2>
     <p class="muted small">1–6 級分估計，紅線是目標 ${fmtBand(target)}。點題型可以額外練習。</p>
     <div>${rows}</div>
     ${trend.length > 1 ? `<h2>整體趨勢</h2>${sparkline(trend.slice(-60), target)}` : ''}
-    <div class="sheet"><a class="task" href="#/writing"><div class="spacer"><div class="name">寫作紀錄</div>
-      <div class="sub">過去的信件與學術討論作答、分數和批改</div></div><span class="muted">›</span></a></div>
-    <h2>最近的練習</h2>
-    ${hist ? `<ul class="hist">${hist}</ul>` : '<p class="muted">還沒有練習紀錄。從「今天」的診斷開始。</p>'}
+    <div class="sheet"><a class="task" href="#/writing"><div class="spacer"><div class="name">寫作與口說紀錄</div>
+      <div class="sub">信件、學術討論和模擬面試的作答、分數和批改</div></div><span class="muted">›</span></a></div>
+    <h2>過去的練習</h2>
+    <p class="muted small">依題型分類，點開看每一次的結果。</p>
+    <div>${groups}</div>
   </main>`, { tab: 'progress' });
+
+  $app.querySelectorAll('.tgroup').forEach(det => det.addEventListener('toggle', () => {
+    if (det.open && !det.dataset.loaded && d.byType?.[det.dataset.type]) loadTypeHistory(det);
+  }));
+}
+
+function historyRow(a) {
+  const m = META.tasks[a.type];
+  const mark = m.max5 ? `${fmtBand(a.raw_score)}<small>/5</small>` : `${a.raw_score}<small>/${a.max_score}</small>`;
+  return `<li><a href="#/attempt/${a.id}"><span class="spacer">${esc(a.day)}${a.mode === 'diagnostic' ? '<span class="tag plain">診斷</span>' : ''}</span>
+    <span class="muted small">${fmtTime(a.seconds || 0)}</span><b>${mark}</b></a></li>`;
+}
+
+async function loadTypeHistory(det, before = null) {
+  det.dataset.loaded = '1';
+  const box = det.querySelector('.tlist');
+  try {
+    const p = await api(`/api/history?type=${det.dataset.type}${before ? `&before=${before}` : ''}`);
+    const list = `<ul class="hist">${p.items.map(historyRow).join('')}</ul>`;
+    if (before) { box.querySelector('.tmore')?.remove(); box.insertAdjacentHTML('beforeend', list); } else box.innerHTML = list;
+    if (WRITING.includes(det.dataset.type) && !before) {
+      box.insertAdjacentHTML('afterbegin', `<p class="small"><a class="link" href="#/writing?type=${det.dataset.type}">在寫作與口說紀錄裡看作答內容 ›</a></p>`);
+    }
+    if (p.more) {
+      box.insertAdjacentHTML('beforeend', '<button class="link small tmore">載入更多</button>');
+      box.querySelector('.tmore').onclick = () => loadTypeHistory(det, p.next);
+    }
+  } catch (e) {
+    det.dataset.loaded = '';
+    box.innerHTML = `<p class="error small">${esc(e.message)}</p>`;
+  }
 }
 
 // ---------- Settings ----------

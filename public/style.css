@@ -206,8 +206,46 @@ summary { cursor: pointer; font-weight: 700; }
 .hist a { display: flex; gap: 10px; padding: 10px 0; border-top: 1px solid var(--rule); text-decoration: none; }
 .chart { width: 100%; height: auto; display: block; }
 
+/* ---------- Listening and speaking ---------- */
+.player { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin: 14px 0; }
+.player .pstate { flex-basis: 100%; }
+.speed { display: inline-flex; border: 1px solid var(--rule); border-radius: var(--radius-s); overflow: hidden; }
+.speed button { min-height: 40px; padding: 0 12px; border: 0; background: transparent; cursor: pointer; color: var(--graphite); font-weight: 700; }
+.speed button + button { border-left: 1px solid var(--rule); }
+.speed button.on { background: var(--ink); color: var(--card); }
+.transcript summary { cursor: pointer; font-weight: 700; }
+.transcript p { margin: 8px 0 0; line-height: 1.7; }
+.repstep { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
+.dots { display: flex; gap: 5px; }
+.dots i { width: 11px; height: 11px; border-radius: 50%; border: 1.5px solid var(--graphite); }
+.dots i.on { background: var(--ink); border-color: var(--ink); }
+.dots i.cur { border-color: var(--ink); background: var(--hl); }
+textarea.short { min-height: 0; height: auto; }
+.answer-clock { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 1.25rem; }
+.answer-clock.over { color: var(--red); }
+#ans { min-height: 30vh; }
+.card.rep .row { align-items: baseline; }
+.card.rep b small, .card.iq small { color: var(--graphite); font-weight: 400; }
+.reptarget { margin: 8px 0 4px; line-height: 1.7; }
+mark.miss { background: transparent; color: var(--red); text-decoration: underline wavy var(--red); text-underline-offset: 3px; font-weight: 700; }
+.card.iq { margin-top: 14px; }
+.card.iq p { margin: 4px 0; }
+.ianswer { white-space: pre-wrap; border-left: 3px solid var(--rule); padding-left: 8px; }
+h3.sec { margin: 18px 0 4px; font-size: 1rem; }
+h3.sec .small { font-weight: 400; margin-left: 6px; }
+.tgroup { border-top: 1px solid var(--rule); }
+.tgroup summary { display: flex; gap: 10px; align-items: baseline; padding: 12px 0; cursor: pointer; list-style: none; }
+.tgroup summary::-webkit-details-marker { display: none; }
+.tgroup summary::after { content: '›'; color: var(--graphite); transition: transform .15s; }
+.tgroup[open] summary::after { transform: rotate(90deg); }
+.tgroup .tlist { padding: 0 0 10px 12px; }
+.tgroup .hist a { padding: 8px 0; }
+.tag.plain { color: var(--graphite); border-color: var(--rule); }
+.btn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.bands .typed .k { white-space: nowrap; }
+
 /* ---------- Writing record ---------- */
-.wstats { display: grid; grid-template-columns: 1fr 1fr; border-top: 1.5px solid var(--ink); border-bottom: 1px solid var(--rule); }
+.wstats { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1.5px solid var(--ink); border-bottom: 1px solid var(--rule); }
 .wstats div { padding: 10px 6px; text-align: center; display: flex; flex-direction: column; gap: 2px; }
 .wstats div + div { border-left: 1px solid var(--rule); }
 .wstats b { font-size: 1.5rem; font-variant-numeric: tabular-nums; }

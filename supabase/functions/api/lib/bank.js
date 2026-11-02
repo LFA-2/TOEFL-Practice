@@ -1,6 +1,6 @@
 // Item bank: adaptive selection, on-demand generation, attempt recording.
 // Items are shared by all approved users; attempts are private (RLS).
-import { TASKS, scoreObjective, publicContent } from './tasks.js';
+import { TASKS, MC_TYPES, scoreObjective, publicContent } from './tasks.js';
 import * as skills from './skills.js';
 import { today } from './time.js';
 import { tryLock, unlock, sleep } from './store.js';
@@ -85,7 +85,7 @@ export async function topUp(ctx, type) {
 
 function explainObjective(item, result) {
   const c = item.content;
-  if (item.type === 'rdl' || item.type === 'acad') {
+  if (MC_TYPES.includes(item.type)) {
     return c.questions.map((q, i) => ({ ...result.detail[i], explain_zh: q.explain_zh, options: q.options, q: q.q }));
   }
   if (item.type === 'bas') return [{ ...result.detail[0], explain_zh: c.explain_zh || '' }];
@@ -97,7 +97,14 @@ export async function submit(ctx, { itemId, response, seconds, mode = 'practice'
   if (!item) throw new HttpError(404, 'item not found');
   const type = item.type;
   let result, feedback;
-  if (TASKS[type].ai) {
+  if (type === 'interview') {
+    const n = item.content.questions.length;
+    const answers = Array.from({ length: n }, (_, i) => String((Array.isArray(response.answers) && response.answers[i]) || ''));
+    response = { ...response, answers, text: answers.join('\n\n') }; // text: for the writing & speaking record
+    feedback = await ctx.ai.gradeInterview(item.content, answers, answers.some(a => a.trim()) ? ctx.charge : null);
+    const raw = roundHalf(feedback.score);
+    result = { score: raw / 5, raw, max: 5 };
+  } else if (TASKS[type].ai) {
     const text = String(response.text || '');
     feedback = await ctx.ai.grade(type, item.content, text, seconds || 0, text.trim() ? ctx.charge : null);
     const raw = roundHalf(feedback.score);
@@ -141,7 +148,8 @@ export async function writingHistory(db, { types, before = null, limit = 20 }) {
            a.feedback->>'summary_zh' as summary,
            a.feedback->>'next_focus_zh' as next_focus,
            i.content->>'scenario' as scenario, i.content->>'to' as recipient,
-           i.content->>'course' as course, i.content->>'professor' as professor
+           i.content->>'course' as course, i.content->>'professor' as professor,
+           i.content->>'topic' as topic, i.content->'questions'->>0 as first_q
     from public.attempts a join public.items i on i.id = a.item_id
     where a.type = any($1::text[]) and ($2::int is null or a.id < $2::int)
     order by a.id desc limit $3::int`, [types, before, limit + 1]);
@@ -150,8 +158,8 @@ export async function writingHistory(db, { types, before = null, limit = 20 }) {
   const items = rows.slice(0, limit).map(r => ({
     id: r.id, type: r.type, score: r.raw_score, seconds: r.seconds, day: r.day,
     words: wordCount(r.text),
-    prompt: r.type === 'email' ? clip(r.scenario, 90) : clip(r.professor, 90),
-    meta: r.type === 'email' ? (r.recipient ? `給 ${clip(r.recipient, 40)}` : '') : clip(r.course, 40),
+    prompt: r.type === 'email' ? clip(r.scenario, 90) : r.type === 'interview' ? clip(r.first_q, 90) : clip(r.professor, 90),
+    meta: r.type === 'email' ? (r.recipient ? `給 ${clip(r.recipient, 40)}` : '') : r.type === 'interview' ? clip(r.topic, 40) : clip(r.course, 40),
     answer: clip(r.text, 120),
     summary: clip(r.summary, 110),
     nextFocus: clip(r.next_focus, 80),
@@ -176,6 +184,23 @@ export async function writingStats(db, types) {
     };
   }
   return out;
+}
+
+// Attempts of one task type, newest first, paged by id (for the history grouped by type).
+export async function historyByType(db, type, before = null, limit = 20) {
+  const rows = await db.q(`select id, type, score, raw_score, max_score, seconds, day, mode
+                           from public.attempts where type = $1 and ($2::int is null or id < $2::int)
+                           order by id desc limit $3::int`, [type, before, limit + 1]);
+  const more = rows.length > limit;
+  const items = rows.slice(0, limit);
+  return { items, more, next: more ? items[items.length - 1].id : null };
+}
+
+// Per type: how many attempts, average score (0-1), the latest day and the latest raw score.
+export async function typeSummary(db) {
+  const rows = await db.q(`select type, count(*)::int as n, avg(score)::float8 as avg, max(day) as last
+                           from public.attempts group by type`);
+  return Object.fromEntries(rows.map(r => [r.type, { n: r.n, avg: r.avg, last: r.last }]));
 }
 
 export async function stock(db) {

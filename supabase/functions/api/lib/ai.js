@@ -207,6 +207,120 @@ JSON: {"items": [{"speaker": "name of A", "context": "what A says", "answer": [c
       explain_zh: String(it.explain_zh || ''),
     })), // several items per call
   }),
+  // ---------- Listening ----------
+  lcr: band => ({
+    prompt: `Write 5 different "Listen and Choose a Response" items at CEFR ${cefrFor(band)}.
+Each item: one person says one short sentence in a campus or daily-life situation (a question, request, offer, complaint or piece of news), ${band < 4 ? '5-10' : '8-16'} words, natural spoken North American English.
+The learner hears it once and picks the most natural reply from 4 written options. Exactly one option is right.
+Wrong options must be tempting: reuse words from the sentence, answer a different question (where vs when), use the wrong tense or person, or sound polite but not fit.
+Vary the situations and sentence types across the 5 items. "voice" is "f" or "m".
+JSON: {"items": [{"voice": "f"|"m", "says": string, "options": [4 strings], "answer": 0-3, "explain_zh": string}]}`,
+    schema: obj({ items: { type: 'array', items: obj({ voice: { type: 'string', enum: ['f', 'm'] }, says: STR, options: { ...STRS, minItems: 4, maxItems: 4 },
+      answer: { type: 'integer', minimum: 0, maximum: 3 }, explain_zh: STR }, ['says', 'options', 'answer']) } }),
+    validate: o => {
+      must(Array.isArray(o.items), 'items');
+      o.items = o.items.filter(it => {
+        if (!it || typeof it.says !== 'string' || !it.says.trim()) return false;
+        try { validQuestions([{ q: '', options: it.options, answer: it.answer, explain_zh: it.explain_zh }], 1); } catch { return false; }
+        it.answer = toIndex(it.answer);
+        return true;
+      });
+      must(o.items.length >= 3, 'items');
+    },
+    build: o => o.items.map(it => {
+      const v = it.voice === 'm' ? 'm' : 'f';
+      return { script: [{ s: v === 'm' ? 'Man' : 'Woman', v, t: it.says.trim() }],
+        questions: [{ q: '', options: it.options.map(String), answer: it.answer, explain_zh: String(it.explain_zh || '') }] };
+    }),
+  }),
+  conv: band => ({
+    prompt: `Write one "Listen to a Conversation" set at CEFR ${cefrFor(band)}.
+- Two people talk in a campus situation (two students, or a student and an office worker, librarian, advisor or professor).
+- 8-12 turns, ${band < 4 ? '120-170' : '170-230'} words in total, natural spoken English (some "well", "actually", "oh, I see"), with a clear problem or purpose.
+- Give the two speakers different genders so their voices sound different ("voice": "f" or "m").
+- Then 2 multiple-choice questions (4 options, one correct): one on the main purpose or problem, one on a detail, an inference, or what a speaker will probably do next.
+JSON: {"title": short English title, "speakers": [{"name": string, "role": string, "voice": "f"|"m"}, {...}], "turns": [{"speaker": name, "text": string}], "questions": [{"q": string, "options": [4 strings], "answer": 0-3, "explain_zh": string}]}`,
+    schema: obj({ title: STR, speakers: { type: 'array', minItems: 2, maxItems: 2, items: obj({ name: STR, role: STR, voice: { type: 'string', enum: ['f', 'm'] } }) },
+      turns: { type: 'array', items: obj({ speaker: STR, text: STR }) }, questions: QUESTIONS }, ['speakers', 'turns', 'questions']),
+    validate: o => {
+      o.speakers = asList(o.speakers).filter(s => s && typeof s.name === 'string');
+      o.turns = asList(o.turns).filter(t => t && typeof t.text === 'string' && t.text.trim());
+      must(o.speakers.length >= 2 && o.turns.length >= 4, 'conversation');
+      validQuestions(o.questions, 2);
+    },
+    build: o => {
+      const [a, b] = o.speakers;
+      const voiceA = a.voice === 'm' ? 'm' : 'f';
+      const voiceB = b.voice === 'f' || b.voice === 'm' ? (b.voice === voiceA ? (voiceA === 'f' ? 'm' : 'f') : b.voice) : (voiceA === 'f' ? 'm' : 'f');
+      const voice = { [a.name]: voiceA, [b.name]: voiceB };
+      return {
+        title: String(o.title || ''),
+        speakers: [{ name: a.name, role: String(a.role || ''), v: voiceA }, { name: b.name, role: String(b.role || ''), v: voiceB }],
+        // a turn whose speaker name doesn't match (e.g. "Student") takes turns with the other voice
+        script: o.turns.map((t, i) => ({ s: String(t.speaker || (i % 2 ? b.name : a.name)), v: voice[t.speaker] || (i % 2 ? voiceB : voiceA), t: t.text.trim() })),
+        questions: o.questions.slice(0, 3),
+      };
+    },
+  }),
+  ann: band => ({
+    prompt: `Write one "Listen to an Announcement" set at CEFR ${cefrFor(band)}.
+- One speaker makes an announcement on campus or at the start of a class (a schedule change, an event, a new rule, a reminder about an assignment), ${band < 4 ? '70-100' : '100-140'} words, spoken style.
+- Then 2 multiple-choice questions (4 options, one correct): the main purpose, and a detail or what listeners should do.
+JSON: {"title": short English title, "speaker": {"role": string, "voice": "f"|"m"}, "text": string, "questions": [{"q": string, "options": [4 strings], "answer": 0-3, "explain_zh": string}]}`,
+    schema: obj({ title: STR, speaker: obj({ role: STR, voice: { type: 'string', enum: ['f', 'm'] } }), text: STR, questions: QUESTIONS }, ['text', 'questions']),
+    validate: o => { must(typeof o.text === 'string' && o.text.split(/\s+/).length >= 40, 'announcement'); validQuestions(o.questions, 2); },
+    build: o => {
+      const v = o.speaker?.voice === 'm' ? 'm' : 'f';
+      return { title: String(o.title || ''), role: String(o.speaker?.role || ''), script: [{ s: String(o.speaker?.role || 'Speaker'), v, t: o.text.trim() }],
+        questions: o.questions.slice(0, 3) };
+    },
+  }),
+  talk: band => ({
+    prompt: `Write one "Listen to an Academic Talk" set at CEFR ${cefrFor(band)}.
+- A professor speaks in an introductory university course (science, history, social science, arts or technology), ${band < 4 ? '170-220' : '230-300'} words, spoken lecture style ("So, today...", "Now, you might wonder...").
+- One clear main idea with an example or two; define any technical term the first time it is used.
+- Then 4 multiple-choice questions (4 options, one correct): main idea, a key detail, why the professor mentions something (function), and an inference.
+JSON: {"title": short English title, "course": string, "voice": "f"|"m", "text": string, "questions": [{"q": string, "options": [4 strings], "answer": 0-3, "explain_zh": string}]}`,
+    schema: obj({ title: STR, course: STR, voice: { type: 'string', enum: ['f', 'm'] }, text: STR, questions: QUESTIONS }, ['text', 'questions']),
+    validate: o => { must(typeof o.text === 'string' && o.text.split(/\s+/).length >= 100, 'talk'); validQuestions(o.questions, 4); },
+    build: o => {
+      const v = o.voice === 'm' ? 'm' : 'f';
+      return { title: String(o.title || ''), course: String(o.course || ''), script: [{ s: 'Professor', v, t: o.text.trim() }], questions: o.questions.slice(0, 5) };
+    },
+  }),
+
+  // ---------- Speaking (typed) ----------
+  rep: band => ({
+    prompt: `Write one "Listen and Repeat" set at CEFR ${cefrFor(band)}.
+- A short situation, for example a guide showing new students around the campus library, a lab, a museum or a dorm.
+- The guide says 7 sentences, one at a time, that the learner must repeat exactly. They get longer: from ${band < 4 ? '4-6 words up to 10-12' : '6-8 words up to 14-18'} words.
+- Natural spoken sentences that fit the situation in order. No numerals (write "three", not "3"), no abbreviations, no names that are hard to spell.
+JSON: {"situation": one English sentence describing the situation, "situation_zh": the same in Traditional Chinese, "voice": "f"|"m", "sentences": [7 strings]}`,
+    schema: obj({ situation: STR, situation_zh: STR, voice: { type: 'string', enum: ['f', 'm'] }, sentences: { ...STRS, minItems: 7, maxItems: 7 } }, ['sentences']),
+    validate: o => {
+      o.sentences = asList(o.sentences).map(String).map(s => s.trim()).filter(Boolean);
+      must(o.sentences.length >= 5, 'sentences');
+    },
+    build: o => {
+      const v = o.voice === 'm' ? 'm' : 'f';
+      return { situation: String(o.situation || ''), situation_zh: String(o.situation_zh || ''), sentences: o.sentences.slice(0, 7).map(t => ({ v, t })) };
+    },
+  }),
+  interview: band => ({
+    prompt: `Write one "Take an Interview" set at CEFR ${cefrFor(band)}.
+- A researcher interviews the learner for a study (topics such as campus life, study habits, technology, work, travel, the environment, community).
+- "intro": one or two sentences the interviewer says first, explaining the study.
+- 4 questions, asked one at a time, 12-35 words each, moving from personal experience, to an opinion with reasons, to a comparison or a hypothetical, to a broader issue.
+JSON: {"topic": short English topic, "topic_zh": the topic in Traditional Chinese, "voice": "f"|"m", "intro": string, "questions": [4 strings]}`,
+    schema: obj({ topic: STR, topic_zh: STR, voice: { type: 'string', enum: ['f', 'm'] }, intro: STR, questions: { ...STRS, minItems: 4, maxItems: 4 } }, ['intro', 'questions']),
+    validate: o => {
+      o.questions = asList(o.questions).map(String).map(s => s.trim()).filter(Boolean);
+      must(o.questions.length >= 4, 'interview questions');
+    },
+    build: o => ({ topic: String(o.topic || ''), topic_zh: String(o.topic_zh || ''), v: o.voice === 'm' ? 'm' : 'f',
+      intro: String(o.intro || ''), questions: o.questions.slice(0, 4) }),
+  }),
+
   email: band => ({
     prompt: `Write one "Write an Email" prompt at CEFR ${cefrFor(band)} difficulty.
 - A realistic situation (university, workplace, community, landlord, club, store) where the learner must write an email.
@@ -329,6 +443,67 @@ async function grade(type, content, text, seconds, charge) {
   };
 }
 
+// ---------------- Speaking: Take an Interview (typed) ----------------
+const INTERVIEW_SYSTEM = `You are an experienced TOEFL iBT speaking rater for the 2026 "Take an Interview" task, scoring on ETS's 0-5 scale.
+The learner TYPED their answers instead of speaking, so you cannot judge pronunciation, intonation or fluency.
+Judge the answers as if they were a transcript of speech: relevance to each question, development (reasons, examples, detail), coherence, and range and accuracy of grammar and vocabulary.
+Do not penalize a natural spoken style (contractions, "I mean", short sentences). On the real test each answer is spoken for 45 seconds (about 80-110 words); here each was typed in 90 seconds, so 50-80 words is a full answer.
+5 = all four answers relevant and well developed, precise language, few errors. 4 = generally well developed, some lapses. 3 = relevant but limited development or frequent errors. 2 = minimal development or many errors. 1 = barely relevant or very little. 0 = no answer.
+Score in steps of 0.5. Be accurate rather than generous: the learner is aiming for an overall band 5.0.
+Write all explanations in Traditional Chinese with Taiwan usage (never Simplified characters or mainland terms); quote and rewrite English in English.
+Return ONLY one JSON object, no markdown fences.`;
+
+const INTERVIEW_SCHEMA = obj({
+  score: { type: 'number', minimum: 0, maximum: 5 },
+  summary_zh: STR,
+  per_question: { type: 'array', items: obj({ comment_zh: STR, better: STR }) },
+  strengths_zh: STRS,
+  corrections: { type: 'array', items: obj({ original: STR, revised: STR, why_zh: STR }) },
+  upgrade: { type: 'array', items: obj({ original: STR, better: STR }) },
+  next_focus_zh: STR,
+}, ['score', 'summary_zh', 'per_question']);
+
+async function gradeInterview(content, answers, charge) {
+  if (!answers.some(a => a.trim())) {
+    return { score: 0, summary_zh: '沒有作答內容。', per_question: content.questions.map(() => ({ comment_zh: '沒有作答。', better: '' })),
+      strengths_zh: [], corrections: [], upgrade: [], next_focus_zh: '' };
+  }
+  const prompt = `Interview topic: ${content.topic}
+Interviewer: ${content.intro}
+${content.questions.map((q, i) => {
+    const a = answers[i] || '';
+    const words = a.trim().split(/\s+/).filter(Boolean).length;
+    return `Question ${i + 1}: ${q}\nLearner's answer (${words} words):\n"""\n${a.trim() || '(no answer)'}\n"""`;
+  }).join('\n\n')}
+
+JSON:
+{"score": number 0-5 for the whole interview,
+ "summary_zh": "2-3 sentences: overall judgement and the single biggest thing holding the score back",
+ "per_question": [exactly ${content.questions.length} items in order {"comment_zh": "1-2 sentences on this answer", "better": "a stronger spoken answer of 60-90 words that keeps the learner's idea"}],
+ "strengths_zh": [up to 3 strings],
+ "corrections": [up to 8 items {"original": exact quote from an answer, "revised": corrected English, "why_zh": short reason}],
+ "upgrade": [up to 4 items {"original": a plain phrase from an answer, "better": a more natural or precise alternative}],
+ "next_focus_zh": "one concrete thing to practise next time"}`;
+  const fb = await askJson({ system: INTERVIEW_SYSTEM, prompt, maxTokens: 4000, schema: INTERVIEW_SCHEMA }, o => {
+    let raw = o.score;
+    if (raw && typeof raw === 'object') raw = Object.values(raw).find(v => typeof v === 'number' || typeof v === 'string');
+    const n = typeof raw === 'number' ? raw : parseFloat(String(raw ?? '').match(/\d+(\.\d+)?/)?.[0]);
+    must(Number.isFinite(n), 'score');
+    o.score = Math.min(5, Math.max(0, n));
+  }, charge);
+  const s = v => (v === undefined || v === null ? '' : String(v));
+  const per = asList(fb.per_question).map(p => (p && typeof p === 'object' ? { comment_zh: s(p.comment_zh), better: s(p.better) } : { comment_zh: s(p), better: '' }));
+  return {
+    score: fb.score,
+    summary_zh: s(fb.summary_zh),
+    per_question: content.questions.map((_, i) => per[i] || { comment_zh: '', better: '' }),
+    strengths_zh: asList(fb.strengths_zh).map(s),
+    corrections: asList(fb.corrections).filter(c => c && typeof c === 'object').map(c => ({ original: s(c.original), revised: s(c.revised), why_zh: s(c.why_zh) })),
+    upgrade: asList(fb.upgrade).filter(u => u && typeof u === 'object').map(u => ({ original: s(u.original), better: s(u.better) })),
+    next_focus_zh: s(fb.next_focus_zh),
+  };
+}
+
 // ---------------- Vocabulary ----------------
 const VOCAB_SYSTEM = `You help a Taiwanese university student build vocabulary for the 2026 TOEFL iBT.
 All Chinese must be Traditional Chinese with Taiwan usage (e.g. 資訊, 軟體, 品質; never Simplified characters or mainland terms).
@@ -430,7 +605,7 @@ JSON: {"quizzes": [{"w": string, "quiz": {"sentence", "distractors": [{"w", "why
 
 export function makeAi(env) {
   Object.assign(config, env);
-  return { generate, grade, vocabCandidates, vocabCards, vocabQuizzes };
+  return { generate, grade, gradeInterview, vocabCandidates, vocabCards, vocabQuizzes };
 }
 
 export { AiError, cefrFor };

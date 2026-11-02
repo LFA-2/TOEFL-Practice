@@ -136,20 +136,29 @@ export function createHandler(deps) {
       return a;
     },
 
-    // Past email / academic discussion answers with their grading, newest first.
+    // Past email / academic discussion / interview answers with their grading, newest first.
     'GET /writing': (ctx, url) => {
       const t = url.searchParams.get('type');
-      const types = t === 'email' || t === 'disc' ? [t] : ['email', 'disc'];
+      const all = ['email', 'disc', 'interview'];
+      const types = all.includes(t) ? [t] : all;
       const before = Number(url.searchParams.get('before')) || null;
       return ctx.db.tx(async db => ({
         ...(await bank.writingHistory(db, { types, before, limit: 20 })),
         // only needed for the first page
-        stats: before ? null : await bank.writingStats(db, ['email', 'disc']),
+        stats: before ? null : await bank.writingStats(db, all),
         target: before ? null : (await plan.settings(db)).target,
       }));
     },
 
+    // Past attempts of one task type, for the history grouped by type.
+    'GET /history': (ctx, url) => {
+      const type = url.searchParams.get('type');
+      if (!TASKS[type]) throw new HttpError(400, 'unknown type');
+      return bank.historyByType(ctx.db, type, Number(url.searchParams.get('before')) || null, 20);
+    },
+
     'GET /dashboard': ctx => ctx.db.tx(async db => ({
+      byType: await bank.typeSummary(db),
       estimates: await skills.estimates(db),
       history: await db.q('select type, rating, day from public.skill_history order by id'),
       daily: await db.q('select day, count(*)::int as n, coalesce(sum(seconds), 0)::int as secs from public.attempts group by day order by day desc limit 30'),

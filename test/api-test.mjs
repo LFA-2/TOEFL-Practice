@@ -105,6 +105,98 @@ await step('writing record lists past email / discussion answers with feedback, 
   assert.equal(typeof full.feedback.summary_zh, 'string');
 });
 
+await step('listening: each type is generated, hides answers, and is scored', async () => {
+  for (const [type, nq] of [['lcr', 1], ['conv', 2], ['ann', 2], ['talk', 4]]) {
+    const it = await a(`/next?type=${type}`);
+    assert.equal(it.status, 200, `${type}: ${JSON.stringify(it.data)}`);
+    const c = it.data.content;
+    assert.ok(Array.isArray(c.script) && c.script.length >= 1 && c.script[0].t, `${type} script`);
+    assert.ok(['f', 'm'].includes(c.script[0].v), `${type} voice`);
+    assert.equal(c.questions.length, nq, `${type} questions`);
+    assert.equal(c.questions[0].answer, undefined, `${type} answer must not be sent`);
+    const r = await a('/submit', { itemId: it.data.id, response: { answers: c.questions.map(() => 0), plays: 2 }, seconds: 60 });
+    assert.equal(r.status, 200, `${type} submit: ${JSON.stringify(r.data)}`);
+    assert.equal(r.data.max, nq);
+    assert.ok(r.data.feedback.detail[0].explain_zh, `${type} explanation`);
+    await idle();
+  }
+  const conv = (await a('/next?type=conv')).data.content;
+  assert.notEqual(conv.script[0].v, conv.script[1].v, 'two voices in a conversation');
+});
+
+await step('speaking: listen and repeat is scored per sentence without AI', async () => {
+  const before = (await a('/me')).data.usage.used;
+  const it = (await a('/next?type=rep')).data;
+  const s = it.content.sentences;
+  assert.equal(s.length, 7);
+  const typed = s.map((x, i) => (i === 0 ? x.t : i === 1 ? x.t.split(' ').slice(0, -1).join(' ') : ''));
+  const r = await a('/submit', { itemId: it.id, response: { answers: typed }, seconds: 120 });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.max, 5);
+  assert.equal(r.data.feedback.detail[0].points, 5);
+  assert.ok(r.data.feedback.detail[1].points < 5 && r.data.feedback.detail[1].points > 0);
+  assert.equal(r.data.feedback.detail[2].points, 0);
+  assert.ok(r.data.feedback.detail[1].marks.some(m => !m.ok), 'missed word marked');
+  await idle();
+  // generation (1) + the background refill of the next item (1); the scoring itself is free
+  assert.equal((await a('/me')).data.usage.used - before, 2);
+});
+
+await step('speaking: interview answers are graded together in one AI call', async () => {
+  const it = (await a('/next?type=interview')).data;
+  assert.equal(it.content.questions.length, 4);
+  const before = (await a('/me')).data.usage.used;
+  const r = await a('/submit', { itemId: it.id, response: { answers: ['I study in the library because it is quiet.', 'Alone.', '', 'Yes.'] }, seconds: 300 });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.raw, 3);
+  assert.equal(r.data.feedback.per_question.length, 4);
+  await idle();
+  // grading all four answers (1) + the background refill of the next item (1)
+  assert.equal((await a('/me')).data.usage.used - before, 2);
+  const rec = (await a('/writing?type=interview')).data;
+  assert.equal(rec.items.length, 1);
+  assert.equal(rec.items[0].words, 11);
+  assert.ok(rec.items[0].prompt.length > 5);
+  assert.equal(rec.stats.interview.n, 1);
+});
+
+await step('estimates: speaking is shown but left out of the overall', async () => {
+  const t = (await a('/today')).data;
+  const sec = t.estimates.sections;
+  assert.ok(sec.listening && sec.speaking && sec.reading && sec.writing);
+  assert.equal(sec.speaking.typed, true);
+  const expected = Math.round(((sec.reading.exact + sec.listening.exact + sec.writing.exact) / 3) * 2) / 2;
+  assert.equal(t.estimates.overall, expected);
+});
+
+await step('history by type is paged and the dashboard counts each type', async () => {
+  const d = (await a('/dashboard')).data;
+  assert.equal(d.byType.lcr.n, 1);
+  assert.equal(d.byType.email.n, 1);
+  const h = (await a('/history?type=lcr')).data;
+  assert.equal(h.items.length, 1);
+  assert.equal(h.items[0].type, 'lcr');
+  assert.equal((await a('/history?type=nope')).status, 400);
+});
+
+await step('daily plan: once every type is measured, it has listening and speaking, in test order', async () => {
+  for (const type of ['rdl', 'acad', 'bas']) {
+    const it = (await a(`/next?type=${type}`)).data;
+    const response = type === 'bas' ? { order: it.content.chunks } : { answers: it.content.questions.map(() => 0) };
+    assert.equal((await a('/submit', { itemId: it.id, response, seconds: 30 })).status, 200);
+    await idle();
+  }
+  await a('/settings', {}); // rebuilds today's plan
+  const p = (await a('/today')).data.plan;
+  assert.equal(p.diagnostic, false);
+  const sections = { lcr: 'l', conv: 'l', ann: 'l', talk: 'l', rep: 's', interview: 's' };
+  assert.ok(p.tasks.some(t => sections[t.type] === 'l'), JSON.stringify(p.tasks));
+  assert.ok(p.tasks.some(t => sections[t.type] === 's'), JSON.stringify(p.tasks));
+  const order = ['ctw', 'rdl', 'acad', 'lcr', 'conv', 'ann', 'talk', 'rep', 'interview', 'bas', 'email', 'disc'];
+  const idx = p.tasks.map(t => order.indexOf(t.type));
+  assert.deepEqual(idx, [...idx].sort((x, y) => x - y), 'reading, listening, speaking, writing');
+});
+
 let screen;
 await step('vocab screening fills the pool via AI', async () => {
   const r = await a('/vocab/screen');

@@ -21,6 +21,16 @@ export async function saveSettings(db, s) {
   await setSetting(db, 'plan', s);
 }
 
+// Bump when new task types are added, so today's saved plan is rebuilt to include them.
+const PLAN_VERSION = 2;
+
+// How many of each type the diagnostic asks for.
+const DIAGNOSTIC_COUNT = { ctw: 2, bas: 5, lcr: 5 };
+
+// Points each type carries on the real test (shapes the daily split), and a cap per day.
+const POINT_WEIGHT = { ctw: 30, rdl: 10, acad: 10, lcr: 17, conv: 10, ann: 8, talk: 12, rep: 7, interview: 8, bas: 10 };
+const CAP_MINUTES = { ctw: 36, rdl: 15, acad: 21, lcr: 9, conv: 9, ann: 6, talk: 10, rep: 8, interview: 9, bas: 15 };
+
 function phaseFor(daysLeft) {
   if (daysLeft <= 0) return { key: 'done', zh: '考試日已過', factor: 0 };
   if (daysLeft <= 6) return { key: 'taper', zh: '考前收尾', factor: 0.5 };
@@ -47,11 +57,11 @@ export async function buildPlan(db, day) {
   let used = 0;
   for (const type of unmeasured) {
     const t = TASKS[type];
-    const target = type === 'bas' ? 5 : type === 'ctw' ? 2 : 1;
+    const target = DIAGNOSTIC_COUNT[type] || 1;
     tasks.push({ type, target, minutes: target * t.unitMinutes, diagnostic: true });
     used += target * t.unitMinutes;
   }
-  if (unmeasured.length) return { day, daysLeft, phase, budget, vocabMinutes, tasks, diagnostic: true };
+  if (unmeasured.length) return { v: PLAN_VERSION, day, daysLeft, phase, budget, vocabMinutes, tasks, diagnostic: true };
 
   // 2. One long writing task every day, alternating.
   const writingType = (daysBetween('2026-01-01', day) % 2 === 0) ? 'email' : 'disc';
@@ -69,29 +79,51 @@ export async function buildPlan(db, day) {
 
   // 3. Spread the rest by gap-to-target, weighted by how many points each type carries,
   //    with caps so no single drill eats the whole session.
-  const pointWeight = { ctw: 30, rdl: 10, acad: 10, bas: 10 };
-  const capMinutes = { ctw: 36, rdl: 15, acad: 21, bas: 15 };
   const stretch = phase.key === 'base' ? 1.5 : 1.0; // early on, lean harder on weaknesses
-  const pool = skills.filter(k => pointWeight[k.type]);
-  const weights = pool.map(k => {
+  const listenBoost = phase.key === 'mock' || phase.key === 'taper' ? 1.4 : 1; // more listening close to the exam
+  const pool = skills.filter(k => POINT_WEIGHT[k.type]);
+  const weightOf = k => {
     const gap = Math.max(0, s.target + 0.25 - k.rating);
-    return (Math.pow(gap, stretch) + 0.25) * Math.sqrt(pointWeight[k.type]);
-  });
+    const boost = TASKS[k.type].section === 'listening' ? listenBoost : 1;
+    return (Math.pow(gap, stretch) + 0.25) * Math.sqrt(POINT_WEIGHT[k.type]) * boost;
+  };
+  const weights = pool.map(weightOf);
   const totalW = weights.reduce((a, b) => a + b, 0);
   const remaining = Math.max(0, budget - used);
   let spent = 0;
+  const add = (type, units) => {
+    const t = TASKS[type];
+    const minutes = Math.round(units * t.unitMinutes);
+    tasks.push({ type, target: units, minutes });
+    spent += minutes;
+  };
   pool.forEach((k, i) => {
     const t = TASKS[k.type];
-    const minutes = Math.min(capMinutes[k.type], remaining * weights[i] / totalW);
+    const minutes = Math.min(CAP_MINUTES[k.type], remaining * weights[i] / totalW);
     const units = Math.round(minutes / t.unitMinutes / t.sessionSize) * t.sessionSize;
-    if (units > 0) { tasks.push({ type: k.type, target: units, minutes: units * t.unitMinutes }); spent += units * t.unitMinutes; }
+    if (units > 0) add(k.type, units);
   });
+
+  // Every day has some listening and some speaking, even if the split above rounded them away:
+  // the weakest listening type, and the speaking types taking turns.
+  const has = section => tasks.some(t => TASKS[t.type].section === section);
+  if (!has('listening')) {
+    const best = pool.filter(k => TASKS[k.type].section === 'listening').sort((a, b) => weightOf(b) - weightOf(a))[0];
+    if (best) add(best.type, TASKS[best.type].sessionSize);
+  }
+  if (!has('speaking')) {
+    const speakType = (daysBetween('2026-01-01', day) % 2 === 0) ? 'rep' : 'interview';
+    add(speakType, 1);
+  }
 
   // Time left over after the caps goes to the other long writing task.
   if (!otherAdded && remaining - spent >= TASKS[other].unitMinutes) {
     tasks.push({ type: other, target: 1, minutes: TASKS[other].unitMinutes });
   }
-  return { day, daysLeft, phase, budget, vocabMinutes, tasks, diagnostic: false };
+  // Order like the real test: reading, listening, speaking, writing.
+  const order = Object.keys(TASKS);
+  tasks.sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
+  return { v: PLAN_VERSION, day, daysLeft, phase, budget, vocabMinutes, tasks, diagnostic: false };
 }
 
 // Plans are frozen once created for the day, so they don't shift mid-session.
@@ -103,6 +135,7 @@ export async function getPlan(db, day = today()) {
   // Such a plan is unusable: rebuild it instead of failing the whole page.
   if (typeof plan === 'string') { try { plan = JSON.parse(plan); } catch { plan = null; } }
   if (plan && !Array.isArray(plan.tasks)) plan = null;
+  if (plan && (plan.v || 1) < PLAN_VERSION) plan = null; // made before the newest task types existed
   if (!plan) {
     plan = await buildPlan(db, day);
     await savePlan(db, day, plan);
