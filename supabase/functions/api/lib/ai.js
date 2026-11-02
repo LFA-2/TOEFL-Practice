@@ -221,7 +221,12 @@ async function grade(type, content, text, seconds, charge) {
     return { score: 0, summary_zh: '沒有作答內容。', strengths_zh: [], corrections: [], upgrade: [], model_answer: '', next_focus_zh: '' };
   }
   const fb = await askJson({ system: GRADE_SYSTEM, prompt: gradePrompt(type, content, text, seconds), maxTokens: 3000 },
-    o => must(typeof o.score === 'number' && o.score >= 0 && o.score <= 5, 'score'), charge);
+    o => {
+      // The model sometimes sends the score as a string ("3.5") or slightly out of range; accept and clamp it.
+      const n = typeof o.score === 'string' ? parseFloat(o.score) : o.score;
+      must(typeof n === 'number' && Number.isFinite(n), 'score');
+      o.score = Math.min(5, Math.max(0, n));
+    }, charge);
   // The model sometimes returns a single string where a list is asked for; always hand back arrays.
   const list = v => (Array.isArray(v) ? v : v ? [v] : []);
   return { ...fb, strengths_zh: list(fb.strengths_zh), corrections: list(fb.corrections), upgrade: list(fb.upgrade) };
