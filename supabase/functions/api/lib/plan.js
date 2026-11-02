@@ -98,6 +98,10 @@ export async function buildPlan(db, day) {
 export async function getPlan(db, day = today()) {
   const row = await db.one('select tasks from public.plans where day = $1', [day]);
   let plan = row ? row.tasks : null;
+  // A saved plan can come back as a JSON string (stored twice-encoded) or without its task list.
+  // Such a plan is unusable: rebuild it instead of failing the whole page.
+  if (typeof plan === 'string') { try { plan = JSON.parse(plan); } catch { plan = null; } }
+  if (plan && !Array.isArray(plan.tasks)) plan = null;
   if (!plan) {
     plan = await buildPlan(db, day);
     await savePlan(db, day, plan);
