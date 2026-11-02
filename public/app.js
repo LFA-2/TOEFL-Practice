@@ -501,13 +501,16 @@ function renderWriting(session) {
 }
 
 function writingFeedback(fb, text) {
-  const list = (arr, fn) => (arr && arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>');
+  const asList = v => (Array.isArray(v) ? v : v ? [v] : []);
+  const list = (v, fn) => { const arr = asList(v); return arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>'; };
+  const strengths = asList(fb.strengths_zh);
+  const upgrade = asList(fb.upgrade);
   return `<div class="fb">
     <p>${esc(fb.summary_zh)}</p>
     ${fb.task_zh ? `<h3>題目要求</h3><p>${esc(fb.task_zh)}</p>` : ''}
-    ${fb.strengths_zh?.length ? `<h3>做得好的地方</h3><ul>${fb.strengths_zh.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+    ${strengths.length ? `<h3>做得好的地方</h3><ul>${strengths.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
     <h3>修改</h3>${list(fb.corrections, c => `<li><del>${esc(c.original)}</del><ins>${esc(c.revised)}</ins><span class="why">${esc(c.why_zh)}</span></li>`)}
-    ${fb.upgrade?.length ? `<h3>可以換成更精準的說法</h3>${list(fb.upgrade, u => `<li><del>${esc(u.original)}</del><ins>${esc(u.better)}</ins></li>`)}` : ''}
+    ${upgrade.length ? `<h3>可以換成更精準的說法</h3>${list(upgrade, u => `<li><del>${esc(u.original)}</del><ins>${esc(u.better)}</ins></li>`)}` : ''}
     ${fb.next_focus_zh ? `<h3>下次練習的重點</h3><p>${esc(fb.next_focus_zh)}</p>` : ''}
     ${fb.model_answer ? `<details><summary>5 分範文（保留你的想法改寫）</summary><div class="card passage" style="margin-top:8px">${esc(fb.model_answer)}</div></details>` : ''}
     ${text != null ? `<details><summary>你的原文</summary><div class="card passage" style="margin-top:8px">${esc(text)}</div></details>` : ''}

@@ -220,8 +220,11 @@ async function grade(type, content, text, seconds, charge) {
   if (!text.trim()) {
     return { score: 0, summary_zh: '沒有作答內容。', strengths_zh: [], corrections: [], upgrade: [], model_answer: '', next_focus_zh: '' };
   }
-  return askJson({ system: GRADE_SYSTEM, prompt: gradePrompt(type, content, text, seconds), maxTokens: 3000 },
+  const fb = await askJson({ system: GRADE_SYSTEM, prompt: gradePrompt(type, content, text, seconds), maxTokens: 3000 },
     o => must(typeof o.score === 'number' && o.score >= 0 && o.score <= 5, 'score'), charge);
+  // The model sometimes returns a single string where a list is asked for; always hand back arrays.
+  const list = v => (Array.isArray(v) ? v : v ? [v] : []);
+  return { ...fb, strengths_zh: list(fb.strengths_zh), corrections: list(fb.corrections), upgrade: list(fb.upgrade) };
 }
 
 // ---------------- Vocabulary ----------------
