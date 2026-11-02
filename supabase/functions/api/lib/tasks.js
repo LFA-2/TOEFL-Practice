@@ -100,6 +100,13 @@ function basFixed(answer) {
   return fixed;
 }
 
+// Lowercase the first letter of a word chunk, keeping "I" and acronyms such as "TOEFL".
+// Proper nouns are lowercased too, so generated content should avoid starting a blank chunk with one.
+function lowerLead(s) {
+  if (/^I\b/.test(s) || /^[A-Z]{2,}/.test(s)) return s;
+  return s.replace(/^(\s*)([A-Z])/, (_, sp, c) => sp + c.toLowerCase());
+}
+
 // Strip answers before sending an item to the browser.
 function publicContent(type, content) {
   if (type === 'ctw') return { tokens: content.tokens };
@@ -111,7 +118,8 @@ function publicContent(type, content) {
     // Like the real task: some chunks are printed in place, the rest are blanks filled from a word bank.
     const fixed = basFixed(content.answer);
     const template = content.answer.map((c, i) => (fixed.has(i) ? { t: c } : { blank: true }));
-    const chunks = [...content.answer.filter((_, i) => !fixed.has(i)), ...(content.extra ? [content.extra] : [])];
+    // Draggable chunks are lowercase, as on the real test (only "I" and acronyms keep their capital).
+    const chunks = [...content.answer.filter((_, i) => !fixed.has(i)), ...(content.extra ? [content.extra] : [])].map(lowerLead);
     let seed = hash(chunks.join('|'));
     for (let i = chunks.length - 1; i > 0; i--) { // deterministic shuffle so a reload shows the same order
       seed = (seed * 9301 + 49297) % 233280;

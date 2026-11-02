@@ -449,7 +449,10 @@ function renderBas(session) {
     reply.innerHTML = template.map((t, i) => {
       if (!t.blank) return `<span class="given">${esc(t.t)}</span>`;
       const ci = filled.get(i);
-      return ci === undefined ? `<span class="slot" aria-label="空格"></span>` : `<button class="chip placed" data-slot="${i}">${esc(c.chunks[ci])}</button>`;
+      if (ci === undefined) return `<span class="slot" aria-label="空格"></span>`;
+      // the chip is lowercase; capitalize it only where it starts the sentence
+      const word = i === 0 ? c.chunks[ci].replace(/^(\s*)([a-z])/, (_, sp, ch) => sp + ch.toUpperCase()) : c.chunks[ci];
+      return `<button class="chip placed" data-slot="${i}">${esc(word)}</button>`;
     }).join(' ') + `<span class="given">${esc(c.end)}</span>`;
     const used = new Set(filled.values());
     document.querySelectorAll('#chips .chip').forEach(b => b.classList.toggle('used', used.has(Number(b.dataset.i))));
