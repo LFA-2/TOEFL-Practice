@@ -9,6 +9,8 @@ let timerHandle = null;
 // ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const LETTERS = 'ABCD';
+// AI-made content may hold a single value where a list is expected (older saved items too).
+const asList = v => (Array.isArray(v) ? v : v === undefined || v === null || v === '' ? [] : [v]);
 const fmtBand = v => (v == null ? '—' : Number(v).toFixed(1));
 const fmtTime = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const words = t => (t.trim().match(/\S+/g) || []).length;
@@ -501,7 +503,6 @@ function renderWriting(session) {
 }
 
 function writingFeedback(fb, text) {
-  const asList = v => (Array.isArray(v) ? v : v ? [v] : []);
   const list = (v, fn) => { const arr = asList(v); return arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>'; };
   const strengths = asList(fb.strengths_zh);
   const upgrade = asList(fb.upgrade);
@@ -584,8 +585,8 @@ function cardBack(w) {
   return `<div class="vback">
     <p class="vzh"><span class="pos">${esc(c.pos || '')}</span>${esc(c.zh || '')}</p>
     ${c.example ? `<p class="vex">${ex}</p><p class="muted small">${esc(c.example_zh || '')}</p>` : ''}
-    ${c.collocations?.length ? `<p class="small"><b>常見搭配</b>　${c.collocations.map(esc).join('、')}</p>` : ''}
-    ${c.family?.length ? `<p class="small"><b>詞性變化</b>　${c.family.map(f => `${esc(f.w)} <span class="muted">${esc(f.pos)}</span>`).join('、')}</p>` : ''}
+    ${asList(c.collocations).length ? `<p class="small"><b>常見搭配</b>　${asList(c.collocations).map(x => esc(x)).join('、')}</p>` : ''}
+    ${asList(c.family).length ? `<p class="small"><b>詞性變化</b>　${asList(c.family).map(f => (f && typeof f === 'object' ? `${esc(f.w)} <span class="muted">${esc(f.pos)}</span>` : esc(f))).join('、')}</p>` : ''}
     ${c.tip_zh ? `<p class="small explain">${esc(c.tip_zh)}</p>` : ''}
   </div>`;
 }
@@ -822,7 +823,7 @@ async function vocabQuizRun({ free = false, params = new URLSearchParams() } = {
     document.getElementById('check').onclick = () => {
       const given = (read()[0] || '').replace(/\s/g, '').toLowerCase();
       const target = w.word.toLowerCase();
-      const near = [...(c.quiz?.synonyms || []), ...(c.family || []).map(f => String(f.w).toLowerCase())];
+      const near = [...asList(c.quiz?.synonyms), ...asList(c.family).map(f => String(f?.w ?? f).toLowerCase())];
       let result; let msg;
       if (given === target) { result = hinted ? 'hard' : 'good'; msg = hinted ? '拼對了（用了提示）' : '拼對了'; }
       else if (given && near.includes(given)) { result = 'hard'; msg = `「${given}」很接近，但這裡要的是 ${w.word}`; }

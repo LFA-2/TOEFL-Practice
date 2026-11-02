@@ -7,9 +7,36 @@ import { AiError } from './errors.js';
 const CEFR = { 1: 'A1', 2: 'A2', 3: 'B1', 4: 'B2', 5: 'C1', 6: 'C2' };
 const cefrFor = band => CEFR[Math.min(6, Math.max(1, Math.round(band)))];
 
-// Structured output: the API is forced to call a "submit" tool, so the result arrives as an
+// Structured output: the model is asked to call a "submit" tool, so the result arrives as an
 // already-parsed object instead of JSON text the model might mistype (a missing comma etc.).
+// Every call passes a typed schema: with a loose one the model tends to send arrays and numbers as strings.
 const GENERIC_SCHEMA = { type: 'object', additionalProperties: true };
+const STR = { type: 'string' };
+const STRS = { type: 'array', items: STR };
+const obj = (properties, required = Object.keys(properties)) => ({ type: 'object', required, properties });
+
+// Tool input sometimes still carries a nested array or object as a JSON string ("[{...}]"); parse those back.
+function revive(v) {
+  if (Array.isArray(v)) return v.map(revive);
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, revive(x)]));
+  if (typeof v === 'string' && /^\s*[[{]/.test(v)) {
+    try { return revive(JSON.parse(v)); } catch { return v; }
+  }
+  return v;
+}
+
+// A list field that arrived as a single value becomes a one-item list; missing becomes empty.
+const asList = v => (Array.isArray(v) ? v : v === undefined || v === null || v === '' ? [] : [v]);
+
+// Multiple-choice answer index: accepts 2, "2", "C" or "c".
+function toIndex(a) {
+  if (typeof a === 'string') {
+    const t = a.trim();
+    if (/^[A-Da-d]$/.test(t)) return t.toUpperCase().charCodeAt(0) - 65;
+    if (/^\d+$/.test(t)) return Number(t);
+  }
+  return a;
+}
 
 // Filled in by makeAi(): { anthropicKey, model, vocabModel, apiBase, aiMock }
 const config = { anthropicKey: '', model: 'claude-sonnet-5-5', vocabModel: 'claude-haiku-5-5', apiBase: 'https://api.anthropic.com', aiMock: false };
@@ -45,8 +72,8 @@ async function callClaudeJson({ system, prompt, maxTokens = 2500, model = config
   const data = await res.json();
   if (data.stop_reason === 'max_tokens') throw new AiError('AI 回應太長被截斷');
   const tool = data.content.find(b => b.type === 'tool_use');
-  if (tool && tool.input && typeof tool.input === 'object') return tool.input;
-  return parseJson(data.content.filter(b => b.type === 'text').map(b => b.text).join(''));
+  if (tool && tool.input && typeof tool.input === 'object') return revive(tool.input);
+  return revive(parseJson(data.content.filter(b => b.type === 'text').map(b => b.text).join('')));
 }
 
 // Fallback for text replies: strip code fences and repair the usual small slips before giving up.
@@ -66,15 +93,33 @@ function parseJson(text) {
   }
 }
 
+// The model sometimes wraps the answer in an extra layer ({"result": {...}} or {"input": {...}}).
+// Try the object itself first, then each nested object, before giving up.
+function validateUnwrapped(got, validate) {
+  const tries = [got];
+  for (let o = got, depth = 0; o && typeof o === 'object' && !Array.isArray(o) && depth < 3; depth++) {
+    const inner = Object.values(o).filter(v => v && typeof v === 'object' && !Array.isArray(v));
+    if (inner.length !== 1) break;
+    tries.push(inner[0]);
+    o = inner[0];
+  }
+  let first;
+  for (const t of tries) {
+    try { validate(t); return t; } catch (e) { first ??= e; }
+  }
+  const keys = got && typeof got === 'object' ? Object.keys(got).join(',') : typeof got;
+  console.error(`[ai] rejected output, top-level keys: ${keys}; start: ${JSON.stringify(got).slice(0, 300)}`);
+  throw first;
+}
+
 // `charge` counts one call against the user's daily quota (throws when the quota is used up).
 async function askJson(opts, validate, charge) {
   if (charge) await charge();
   let lastErr;
   for (let i = 0; i < 3; i++) {
     try {
-      const obj = await callClaudeJson(opts);
-      validate(obj);
-      return obj;
+      const got = await callClaudeJson(opts);
+      return validateUnwrapped(got, validate);
     } catch (e) {
       lastErr = e;
       if (e instanceof AiError && /API_KEY|401|403|credit|balance/i.test(e.message)) break;
@@ -89,10 +134,16 @@ const must = (cond, msg) => { if (!cond) throw new AiError(`AI output invalid: $
 const validQuestions = (qs, n) => {
   must(Array.isArray(qs) && qs.length >= n, 'questions');
   for (const q of qs) {
-    must(typeof q.q === 'string' && Array.isArray(q.options) && q.options.length === 4, 'question shape');
+    must(q && typeof q.q === 'string' && Array.isArray(q.options) && q.options.length === 4, 'question shape');
+    q.answer = toIndex(q.answer);
     must(Number.isInteger(q.answer) && q.answer >= 0 && q.answer < 4, 'answer index');
+    q.options = q.options.map(String);
+    q.explain_zh = String(q.explain_zh || '');
   }
 };
+
+const QUESTION = obj({ q: STR, options: { ...STRS, minItems: 4, maxItems: 4 }, answer: { type: 'integer', minimum: 0, maximum: 3 }, explain_zh: STR });
+const QUESTIONS = { type: 'array', items: QUESTION };
 
 // ---------------- Generation ----------------
 const GEN_SYSTEM = `You write practice items for the 2026 TOEFL iBT (the redesigned format introduced January 2026).
@@ -107,6 +158,7 @@ const GEN = {
 - The first sentence should be a self-contained topic sentence.
 - Avoid proper nouns, numbers, and hyphenated words after the first sentence.
 JSON: {"topic": string, "passage": string}`,
+    schema: obj({ topic: STR, passage: STR }, ['passage']),
     validate: o => must(typeof o.passage === 'string' && o.passage.split(/\s+/).length >= 50, 'passage'),
     build: o => buildCtw(o.passage.trim()),
   }),
@@ -116,6 +168,7 @@ JSON: {"topic": string, "passage": string}`,
 - Length: ${band < 3 ? '20-50' : band < 5 ? '60-110' : '100-150'} words.
 - 3 multiple-choice questions (4 options each, one correct) testing detail, inference, and purpose.
 JSON: {"genre": string, "text": string, "questions": [{"q": string, "options": [4 strings], "answer": 0-3, "explain_zh": string}]}`,
+    schema: obj({ genre: STR, text: STR, questions: QUESTIONS }, ['text', 'questions']),
     validate: o => { must(typeof o.text === 'string', 'text'); validQuestions(o.questions, 2); },
     build: o => o,
   }),
@@ -124,6 +177,7 @@ JSON: {"genre": string, "text": string, "questions": [{"q": string, "options": [
 - An introductory-textbook style passage of 170-210 words with a title.
 - 5 multiple-choice questions (4 options, one correct), covering: main idea, a key detail, an inference, vocabulary in context, and the rhetorical purpose of a sentence.
 JSON: {"title": string, "passage": string, "questions": [{"q": string, "options": [4 strings], "answer": 0-3, "explain_zh": string}]}`,
+    schema: obj({ title: STR, passage: STR, questions: QUESTIONS }, ['passage', 'questions']),
     validate: o => { must(typeof o.passage === 'string', 'passage'); validQuestions(o.questions, 5); },
     build: o => o,
   }),
@@ -135,35 +189,58 @@ Each item is a short campus or daily-life exchange: speaker A says something; th
 - Optionally one "extra" distractor chunk that does not belong (or null).
 - "end" is the final punctuation of the reply ("." or "?").
 JSON: {"items": [{"speaker": "name of A", "context": "what A says", "answer": [chunks in correct order], "extra": string|null, "end": "."|"?", "explain_zh": string}]}`,
+    schema: obj({ items: { type: 'array', items: obj({ speaker: STR, context: STR, answer: STRS,
+      extra: { type: ['string', 'null'] }, end: { type: 'string', enum: ['.', '?'] }, explain_zh: STR }, ['context', 'answer']) } }),
     validate: o => {
-      must(Array.isArray(o.items) && o.items.length >= 3, 'items');
-      for (const it of o.items) must(Array.isArray(it.answer) && it.answer.length >= 3 && typeof it.context === 'string', 'bas item');
+      must(Array.isArray(o.items), 'items');
+      // drop malformed items rather than failing the whole batch
+      o.items = o.items.filter(it => it && typeof it.context === 'string' && Array.isArray(it.answer) && it.answer.length >= 3
+        && it.answer.every(c => typeof c === 'string' && c.trim()));
+      must(o.items.length >= 3, 'items');
     },
-    build: o => o.items, // several items per call
+    build: o => o.items.map(it => ({
+      speaker: String(it.speaker || 'A'),
+      context: it.context,
+      answer: it.answer.map(c => c.trim()),
+      extra: typeof it.extra === 'string' && it.extra.trim() ? it.extra.trim() : null,
+      end: it.end === '?' ? '?' : '.',
+      explain_zh: String(it.explain_zh || ''),
+    })), // several items per call
   }),
   email: band => ({
     prompt: `Write one "Write an Email" prompt at CEFR ${cefrFor(band)} difficulty.
 - A realistic situation (university, workplace, community, landlord, club, store) where the learner must write an email.
 - Give the recipient and exactly 3 things the email must do (e.g. explain, request, suggest).
 JSON: {"scenario": string, "to": string, "points": [3 strings]}`,
-    validate: o => must(typeof o.scenario === 'string' && Array.isArray(o.points) && o.points.length === 3, 'email'),
-    build: o => o,
+    schema: obj({ scenario: STR, to: STR, points: { ...STRS, minItems: 3, maxItems: 3 } }),
+    validate: o => {
+      o.points = asList(o.points).map(String);
+      must(typeof o.scenario === 'string' && o.points.length >= 3, 'email');
+      o.points = o.points.slice(0, 3);
+    },
+    build: o => ({ scenario: o.scenario, to: String(o.to || ''), points: o.points }),
   }),
   disc: band => ({
     prompt: `Write one "Write for an Academic Discussion" prompt at CEFR ${cefrFor(band)} difficulty.
 - A professor posts a question in an online class discussion (course name given), 60-100 words, ending in a clear question that invites an opinion.
 - Two students reply with different views, 40-70 words each.
 JSON: {"course": string, "professor": string, "students": [{"name": string, "post": string}, {"name": string, "post": string}]}`,
-    validate: o => must(typeof o.professor === 'string' && Array.isArray(o.students) && o.students.length === 2, 'disc'),
-    build: o => o,
+    schema: obj({ course: STR, professor: STR, students: { type: 'array', minItems: 2, maxItems: 2, items: obj({ name: STR, post: STR }) } }),
+    validate: o => {
+      o.students = asList(o.students).filter(s => s && typeof s.post === 'string');
+      must(typeof o.professor === 'string' && o.students.length >= 2, 'disc');
+      o.students = o.students.slice(0, 2).map(s => ({ name: String(s.name || 'Student'), post: s.post }));
+    },
+    build: o => ({ course: String(o.course || ''), professor: o.professor, students: o.students }),
   }),
 };
 
 // Returns an array of item contents (bas returns several at once).
 async function generate(type, band, charge) {
   const g = GEN[type](band);
-  const obj = await askJson({ system: GEN_SYSTEM, prompt: g.prompt, maxTokens: 8000 }, g.validate, charge); // a full reading passage with 5 explained questions needs more room than 3000
-  const built = g.build(obj);
+  // a full reading passage with 5 explained questions needs more room than 3000
+  const out = await askJson({ system: GEN_SYSTEM, prompt: g.prompt, maxTokens: 8000, schema: g.schema }, g.validate, charge);
+  const built = g.build(out);
   return Array.isArray(built) ? built : [built];
 }
 
@@ -189,6 +266,14 @@ const GRADE_SCHEMA = `JSON:
  "upgrade": [up to 4 items {"original": a plain phrase from the response, "better": a more precise or academic alternative}],
  "model_answer": "a rewrite of the learner's response at score 5, keeping their ideas",
  "next_focus_zh": "one concrete thing to practise next time"}`;
+
+const GRADE_TOOL_SCHEMA = obj({
+  score: { type: 'number', minimum: 0, maximum: 5 },
+  summary_zh: STR, task_zh: STR, strengths_zh: STRS,
+  corrections: { type: 'array', items: obj({ original: STR, revised: STR, why_zh: STR }) },
+  upgrade: { type: 'array', items: obj({ original: STR, better: STR }) },
+  model_answer: STR, next_focus_zh: STR,
+}, ['score', 'summary_zh']);
 
 function gradePrompt(type, content, text, seconds) {
   const words = text.trim().split(/\s+/).filter(Boolean).length;
@@ -220,16 +305,28 @@ async function grade(type, content, text, seconds, charge) {
   if (!text.trim()) {
     return { score: 0, summary_zh: '沒有作答內容。', strengths_zh: [], corrections: [], upgrade: [], model_answer: '', next_focus_zh: '' };
   }
-  const fb = await askJson({ system: GRADE_SYSTEM, prompt: gradePrompt(type, content, text, seconds), maxTokens: 3000 },
+  const fb = await askJson({ system: GRADE_SYSTEM, prompt: gradePrompt(type, content, text, seconds), maxTokens: 3000, schema: GRADE_TOOL_SCHEMA },
     o => {
-      // The model sometimes sends the score as a string ("3.5") or slightly out of range; accept and clamp it.
-      const n = typeof o.score === 'string' ? parseFloat(o.score) : o.score;
-      must(typeof n === 'number' && Number.isFinite(n), 'score');
+      // The score may arrive as a string ("3.5", "4/5") or slightly out of range; accept and clamp it.
+      let raw = o.score;
+      if (raw && typeof raw === 'object') raw = Object.values(raw).find(v => typeof v === 'number' || typeof v === 'string'); // {"score": {"value": 4}}
+      const n = typeof raw === 'number' ? raw : parseFloat(String(raw ?? '').match(/\d+(\.\d+)?/)?.[0]);
+      must(Number.isFinite(n), 'score');
       o.score = Math.min(5, Math.max(0, n));
     }, charge);
-  // The model sometimes returns a single string where a list is asked for; always hand back arrays.
-  const list = v => (Array.isArray(v) ? v : v ? [v] : []);
-  return { ...fb, strengths_zh: list(fb.strengths_zh), corrections: list(fb.corrections), upgrade: list(fb.upgrade) };
+  const s = v => (v === undefined || v === null ? '' : String(v));
+  return {
+    score: fb.score,
+    summary_zh: s(fb.summary_zh),
+    task_zh: s(fb.task_zh),
+    strengths_zh: asList(fb.strengths_zh).map(s),
+    corrections: asList(fb.corrections).filter(c => c && typeof c === 'object')
+      .map(c => ({ original: s(c.original), revised: s(c.revised), why_zh: s(c.why_zh) })),
+    upgrade: asList(fb.upgrade).filter(u => u && typeof u === 'object')
+      .map(u => ({ original: s(u.original), better: s(u.better) })),
+    model_answer: s(fb.model_answer),
+    next_focus_zh: s(fb.next_focus_zh),
+  };
 }
 
 // ---------------- Vocabulary ----------------
@@ -260,7 +357,6 @@ const QUIZ_SPEC = `- "quiz": a fill-in-the-blank multiple-choice question for th
   - "distractors": exactly 3 wrong options, each a real English word with the same part of speech. Mix two kinds: near-synonyms that do NOT fit this sentence (wrong collocation, nuance or register), and easily confused look-alikes (e.g. adapt/adopt, affect/effect). Each must be clearly wrong in this sentence. For each give "why_zh": one short Traditional Chinese reason it does not fit.
   - "synonyms": 1-4 words that mean nearly the same as the target word (used to recognise close answers), may be empty`;
 
-const STR = { type: 'string' };
 const QUIZ_SCHEMA = { type: 'object', required: ['sentence', 'distractors'], properties: {
   sentence: STR,
   distractors: { type: 'array', items: { type: 'object', required: ['w', 'why_zh'], properties: { w: STR, why_zh: STR } } },
@@ -301,9 +397,14 @@ JSON: {"cards": [{"w", "pos", "zh", "example", "example_zh", "collocations", "fa
       quiz: QUIZ_SCHEMA } } } } };
   const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 800 + 520 * words.length, model: config.vocabModel, schema },
     o => must(Array.isArray(o.cards) && o.cards.length >= 1, 'cards'), charge);
-  return out.cards.map(c => {
+  return out.cards.filter(c => c && typeof c === 'object').map(c => {
     const w = String(c.w || '').toLowerCase();
-    const { quiz, ...card } = c;
+    const { quiz, ...rest } = c;
+    const card = {
+      ...rest,
+      collocations: asList(rest.collocations).map(String),
+      family: asList(rest.family).map(f => (f && typeof f === 'object' ? { w: String(f.w || ''), pos: String(f.pos || '') } : { w: String(f), pos: '' })).filter(f => f.w),
+    };
     return validQuiz(w, quiz) ? { ...card, quiz: cleanQuiz(quiz) } : card; // a bad quiz is regenerated later
   });
 }
