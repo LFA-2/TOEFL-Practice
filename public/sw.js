@@ -1,6 +1,6 @@
 // Network-first for the app shell so updates show up immediately; cached copy when offline.
 // API calls are never cached.
-const CACHE = 'toefl-coach-v1';
+const CACHE = 'toefl-coach-v2';
 const SHELL = ['/', '/index.html', '/app.js', '/style.css', '/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', e => {

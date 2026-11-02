@@ -73,6 +73,8 @@ p { margin: 0 0 .8em; }
 .bubbles { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; max-width: 120px; }
 .bubbles i { width: 13px; height: 13px; border-radius: 50%; border: 1.5px solid var(--graphite); }
 .bubbles i.on { background: var(--ink); border-color: var(--ink); }
+.task .count { font-weight: 700; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
+.task .count span { color: var(--graphite); font-weight: 400; font-size: .9rem; }
 
 /* ---------- Buttons ---------- */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; padding: 0 20px;
@@ -93,16 +95,22 @@ p { margin: 0 0 .8em; }
 .passage { white-space: pre-wrap; line-height: 1.75; }
 .passage-title { font-weight: 700; margin-bottom: 8px; }
 
-/* Complete the Words */
-.ctw { line-height: 2.3; }
-.ctw .blank { white-space: nowrap; }
-.ctw input { border: 0; border-bottom: 2px solid var(--ink); background: transparent; padding: 0 1px; margin: 0;
-  font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 1rem; letter-spacing: .08em; border-radius: 0; }
-.ctw input:focus { outline: none; background: var(--hl); color: var(--hl-ink); }
-.ctw .prefix { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 1rem; letter-spacing: .08em; }
+/* Complete the Words: one box per missing letter */
+.ctw { line-height: 2.5; }
+.lb { white-space: nowrap; display: inline-flex; align-items: baseline; gap: 2px; vertical-align: baseline; }
+.lb .prefix { margin-right: 1px; }
+.lb-cell { width: 1.2em; height: 1.55em; padding: 0; margin: 0; text-align: center; font: inherit; font-weight: 700;
+  border: 1.5px solid var(--graphite); border-radius: 4px; background: var(--card); color: var(--ink);
+  display: inline-flex; align-items: center; justify-content: center; position: relative; line-height: 1; vertical-align: baseline; }
+input.lb-cell { caret-color: transparent; }
+.lb-cell:focus { outline: none; border-color: var(--ink); background: var(--hl); color: var(--hl-ink); }
+.lb.done .lb-cell { border-color: var(--rule); }
+.lb.right .lb-cell { color: var(--ok); border-color: var(--ok); }
+.lb-cell.bad { border-color: var(--red); color: var(--red); background: transparent; }
+.mine { color: var(--graphite); font-size: .85rem; margin-left: 4px; text-decoration-color: var(--red); }
 .ctw .wrong { color: var(--red); text-decoration: line-through; }
-.ctw .fix { font-family: var(--hand); color: var(--red); font-size: 1.35rem; margin-left: 2px; }
-.ctw .right { color: var(--ok); }
+.right { color: var(--ok); }
+.wrongtxt { color: var(--red); }
 
 /* Multiple choice, as answer-sheet bubbles */
 .q { margin-top: 22px; }
@@ -122,9 +130,10 @@ p { margin: 0 0 .8em; }
 /* Build a Sentence */
 .speech { padding: 12px 14px; background: var(--bubble); border-radius: var(--radius-l) var(--radius-l) var(--radius-l) 4px; max-width: 90%; }
 .speech b { display: block; font-size: .85rem; color: var(--graphite); }
-.slots { min-height: 64px; padding: 12px; border: 1.5px dashed var(--graphite); border-radius: var(--radius-l);
-  display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 16px; }
-.slots .hint { color: var(--graphite); font-size: .9rem; }
+.reply { margin-top: 16px; padding: 14px 12px; border-radius: var(--radius-l); background: var(--card); border: 1px solid var(--rule);
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center; line-height: 1.3; }
+.reply .given { font-weight: 700; }
+.slot { display: inline-block; min-width: 64px; height: 44px; border-bottom: 2px solid var(--ink); }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .chip { min-height: 44px; padding: 0 14px; border-radius: var(--radius-s); border: 1.5px solid var(--ink);
   background: var(--card); cursor: pointer; font-weight: 700; }
@@ -153,6 +162,30 @@ textarea:focus { outline: none; border-color: var(--ink); }
 details { margin-top: 12px; }
 summary { cursor: pointer; font-weight: 700; }
 .delta { font-size: .9rem; color: var(--graphite); }
+
+/* ---------- Vocabulary ---------- */
+.vscreen { max-width: 520px; padding-top: 7vh; }
+.vword { display: flex; flex-direction: column; align-items: center; gap: 6px; margin: 4vh 0 3vh; }
+.vword span { font-size: clamp(2.4rem, 11vw, 3.4rem); font-weight: 700; letter-spacing: -.01em; overflow-wrap: anywhere; text-align: center; }
+.vbtns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 20px; }
+.vbtns .block { grid-column: 1 / -1; }
+.vbtns .btn { padding: 0 8px; min-height: 56px; }
+.vzh { font-size: 1.25rem; font-weight: 700; }
+.pos { font-weight: 400; color: var(--graphite); font-size: .95rem; margin-right: 8px; }
+.vback { border-top: 1.5px solid var(--ink); padding-top: 14px; margin-top: 8px; }
+.vex { margin-bottom: 2px; }
+.vex mark { background: var(--hl); color: var(--hl-ink); padding: 0 2px; }
+.vstats { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1.5px solid var(--ink); border-bottom: 1px solid var(--rule); }
+.vstats div { padding: 10px 4px; text-align: center; }
+.vstats div + div { border-left: 1px solid var(--rule); }
+.vstats b { display: block; font-size: 1.5rem; }
+.vstats span { font-size: .8rem; color: var(--graphite); }
+.wrow { border-top: 1px solid var(--rule); padding: 10px 0; }
+.wrow summary { display: flex; gap: 10px; align-items: baseline; list-style: none; }
+.wrow summary::-webkit-details-marker { display: none; }
+.wrow .due { min-width: 3.5em; text-align: right; }
+.wrow.flat { display: flex; align-items: center; }
+.wrow .vback { border-top: 0; padding-top: 6px; }
 
 /* ---------- Progress ---------- */
 .skill-row { display: grid; grid-template-columns: 1fr 120px 44px; gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid var(--rule); text-decoration: none; }

@@ -12,6 +12,7 @@ const skills = require('./lib/skills');
 const { TASKS, SECTIONS } = require('./lib/tasks');
 const { AiError } = require('./lib/ai');
 const { seedIfEmpty } = require('./lib/seed');
+const vocab = require('./lib/vocab');
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = {
@@ -67,7 +68,7 @@ const routes = {
 
   'GET /api/meta': () => ({ tasks: TASKS, sections: SECTIONS }),
 
-  'GET /api/today': () => ({ plan: plan.getPlan(), estimates: skills.estimates() }),
+  'GET /api/today': () => ({ plan: plan.getPlan(), estimates: skills.estimates(), vocabSettings: vocab.settings() }),
 
   'GET /api/next': async (req, res, url) => {
     const type = url.searchParams.get('type');
@@ -100,8 +101,31 @@ const routes = {
     return { estimates: est, history: hist, daily, recent: bank.history(30), stock: bank.stock(), settings: plan.settings() };
   },
 
+  // ---------- vocabulary ----------
+  'GET /api/vocab/screen': () => vocab.screenBatch(20),
+
+  'POST /api/vocab/mark': async (req) => {
+    const b = await readJson(req);
+    return vocab.mark(Number(b.id), String(b.how));
+  },
+
+  'GET /api/vocab/review': () => vocab.reviewQueue(30),
+
+  'POST /api/vocab/grade': async (req) => {
+    const b = await readJson(req);
+    return vocab.grade(Number(b.id), b.mode === 'spell' ? 'spell' : 'recall', String(b.result));
+  },
+
+  'GET /api/vocab/list': (req, res, url) => ({
+    words: vocab.list({ status: url.searchParams.get('status') === 'known' ? 'known' : 'learning', q: url.searchParams.get('q') || '' }),
+    stats: vocab.stats(),
+  }),
+
   'POST /api/settings': async (req, res) => {
     const b = await readJson(req);
+    if (b.vocabNewPerDay !== undefined) {
+      vocab.saveSettings({ newPerDay: Math.min(150, Math.max(5, Math.round(Number(b.vocabNewPerDay)) || 60)) });
+    }
     const s = plan.settings();
     const next = {
       examDate: /^\d{4}-\d{2}-\d{2}$/.test(b.examDate) ? b.examDate : s.examDate,
@@ -111,7 +135,7 @@ const routes = {
     };
     setSetting('plan', next);
     plan.resetToday();
-    return next;
+    return { ...next, vocabNewPerDay: vocab.settings().newPerDay };
   },
 };
 

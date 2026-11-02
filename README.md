@@ -13,8 +13,20 @@
 | 閱讀 | Complete the Words、Read in Daily Life、Read an Academic Passage | 自動 |
 | 寫作 | Build a Sentence | 自動 |
 | 寫作 | Write an Email、Academic Discussion | Claude（0–5 分 + 逐句修改 + 範文） |
+| 單字 | 每日篩選新字、單字卡、間隔複習 | 自動 |
 
-下一版：聽力（TTS 音檔）、口說（打字版）、錯題本與單字複習、全真模考。
+- **單字填空**照 ETS 官方格式：第一句完整，之後每隔一個字刪掉後半段，共 10 格，一格一個字母，拼字必須完全正確。
+- **句子重組**照實際考法：回覆句裡有部分字固定，其餘空格從字塊填入，可能有一個用不到的干擾字塊，每題 41 秒。
+
+### 單字
+
+1. **挑新單字**：一次一個字，只顯示英文，點「會／不熟／不會」。「會」的字之後不再出現；另外兩種加進單字本。每天的數量在「設定」調整（預設 60）。
+2. **單字卡**：只替你挑出來的字產生，內容有中文意思、詞性、學術例句、常見搭配、詞性變化。用較便宜的 Haiku 模型。
+3. **複習**：依第 1、2、4、7、14、21、45、90 天的間隔排程，兩種練法輪流：看英文想中文（自己評分），以及看中文和例句拼出後半段（自動批改，格式跟單字填空一樣）。
+4. 候選字的難度會跟著你的回答調整：大多會就變難，大多不會就變簡單。
+5. 單字最多佔每天練習時間的一半。
+
+下一版：聽力（TTS 音檔）、口說（打字版）、錯題本、全真模考。
 
 ### 運作方式
 
@@ -81,7 +93,7 @@ systemctl --user status toefl-coach
 
 > 如果 repo 不是放在 `~/TOEFL-Practice`，要改 `.service` 檔裡的 `WorkingDirectory`。
 
-`toefl-generate.timer` 每天凌晨 3:30 用 Claude 補題，讓你白天在手機上作答不用等。
+`toefl-generate.timer` 每天凌晨 3:30 用 Claude 補題、準備隔天要篩選的單字和單字卡，讓你白天在手機上作答不用等。
 
 ### 6. 讓手機連得到（需要 HTTPS）
 
@@ -118,6 +130,14 @@ cloudflared tunnel route dns toefl toefl.你的網域.com
 cd ~/TOEFL-Practice && git pull && systemctl --user restart toefl-coach
 ```
 
+如果 `deploy/` 裡的 systemd 檔有改，再多跑一次：
+
+```bash
+cp deploy/toefl-*.service deploy/toefl-*.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
+```
+
+資料庫的新資料表會在啟動時自動建立，舊的練習紀錄不受影響。手機上如果看到舊畫面，關掉 app 再打開一次。
+
 ## 開發
 
 ```bash
@@ -129,6 +149,7 @@ AI_MOCK=1 node --watch server.js     # 不呼叫 API，用假資料測試
 - `lib/skills.js`：能力估計
 - `lib/plan.js`：每日計畫
 - `lib/bank.js`：選題、出題、作答紀錄
+- `lib/vocab.js`：單字篩選、單字卡、間隔複習
 - `lib/ai.js`：Claude 出題與批改的 prompt
 - `lib/seed.js`：內建的起始題目
 - `public/`：前端（原生 JS）
