@@ -162,7 +162,7 @@ JSON: {"course": string, "professor": string, "students": [{"name": string, "pos
 // Returns an array of item contents (bas returns several at once).
 async function generate(type, band, charge) {
   const g = GEN[type](band);
-  const obj = await askJson({ system: GEN_SYSTEM, prompt: g.prompt, maxTokens: 3000 }, g.validate, charge);
+  const obj = await askJson({ system: GEN_SYSTEM, prompt: g.prompt, maxTokens: 8000 }, g.validate, charge); // a full reading passage with 5 explained questions needs more room than 3000
   const built = g.build(obj);
   return Array.isArray(built) ? built : [built];
 }
