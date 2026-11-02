@@ -1,0 +1,12 @@
+{
+  "name": "toefl-coach",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal adaptive practice for the 2026 TOEFL iBT. Zero dependencies.",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "generate": "node --disable-warning=ExperimentalWarning scripts/generate.js",
+    "dev": "AI_MOCK=1 node --disable-warning=ExperimentalWarning --watch server.js"
+  }
+}
