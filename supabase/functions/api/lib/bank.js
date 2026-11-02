@@ -130,6 +130,54 @@ export async function history(db, limit = 50) {
                from public.attempts order by id desc limit $1::int`, [limit]);
 }
 
+const wordCount = t => String(t || '').trim().split(/\s+/).filter(Boolean).length;
+
+// Past email / academic discussion attempts with a short preview of prompt, answer and feedback.
+// Paged by id: pass the smallest id already shown as `before` to get the next page.
+export async function writingHistory(db, { types, before = null, limit = 20 }) {
+  const rows = await db.q(`
+    select a.id, a.type, a.raw_score, a.seconds, a.day,
+           a.response->>'text' as text,
+           a.feedback->>'summary_zh' as summary,
+           a.feedback->>'next_focus_zh' as next_focus,
+           i.content->>'scenario' as scenario, i.content->>'to' as recipient,
+           i.content->>'course' as course, i.content->>'professor' as professor
+    from public.attempts a join public.items i on i.id = a.item_id
+    where a.type = any($1::text[]) and ($2::int is null or a.id < $2::int)
+    order by a.id desc limit $3::int`, [types, before, limit + 1]);
+  const more = rows.length > limit;
+  const clip = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n)}…` : t; };
+  const items = rows.slice(0, limit).map(r => ({
+    id: r.id, type: r.type, score: r.raw_score, seconds: r.seconds, day: r.day,
+    words: wordCount(r.text),
+    prompt: r.type === 'email' ? clip(r.scenario, 90) : clip(r.professor, 90),
+    meta: r.type === 'email' ? (r.recipient ? `給 ${clip(r.recipient, 40)}` : '') : clip(r.course, 40),
+    answer: clip(r.text, 120),
+    summary: clip(r.summary, 110),
+    nextFocus: clip(r.next_focus, 80),
+  }));
+  return { items, more, next: more ? items[items.length - 1].id : null };
+}
+
+// Count, average and score trend per writing type (oldest first), for the top of the record page.
+export async function writingStats(db, types) {
+  const rows = await db.q(`select type, raw_score from public.attempts
+                           where type = any($1::text[]) and raw_score is not null order by id`, [types]);
+  const out = {};
+  for (const t of types) {
+    const scores = rows.filter(r => r.type === t).map(r => Number(r.raw_score));
+    const last5 = scores.slice(-5);
+    out[t] = {
+      n: scores.length,
+      avg: scores.length ? scores.reduce((x, y) => x + y, 0) / scores.length : null,
+      recentAvg: last5.length ? last5.reduce((x, y) => x + y, 0) / last5.length : null,
+      best: scores.length ? Math.max(...scores) : null,
+      trend: scores.slice(-30),
+    };
+  }
+  return out;
+}
+
 export async function stock(db) {
   return db.q(`select type, count(*)::int as total,
                  (count(*) filter (where not exists (select 1 from public.attempts a where a.item_id = i.id)))::int as unseen

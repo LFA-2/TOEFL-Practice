@@ -136,6 +136,19 @@ export function createHandler(deps) {
       return a;
     },
 
+    // Past email / academic discussion answers with their grading, newest first.
+    'GET /writing': (ctx, url) => {
+      const t = url.searchParams.get('type');
+      const types = t === 'email' || t === 'disc' ? [t] : ['email', 'disc'];
+      const before = Number(url.searchParams.get('before')) || null;
+      return ctx.db.tx(async db => ({
+        ...(await bank.writingHistory(db, { types, before, limit: 20 })),
+        // only needed for the first page
+        stats: before ? null : await bank.writingStats(db, ['email', 'disc']),
+        target: before ? null : (await plan.settings(db)).target,
+      }));
+    },
+
     'GET /dashboard': ctx => ctx.db.tx(async db => ({
       estimates: await skills.estimates(db),
       history: await db.q('select type, rating, day from public.skill_history order by id'),

@@ -1,6 +1,6 @@
 // Network-first for the app shell so updates show up immediately; cached copy when offline.
 // Only same-origin GETs are handled; the API (Supabase) is never cached.
-const CACHE = 'toefl-coach-v4';
+const CACHE = 'toefl-coach-v5';
 const SHELL = ['./', 'index.html', 'app.js', 'config.js', 'style.css', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', e => {

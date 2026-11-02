@@ -123,7 +123,8 @@ async function route() {
     }
     if (!META) META = await api('/api/meta');
     if (parts[0] === 'practice') return await practice(parts[1], params);
-    if (parts[0] === 'attempt') return await attemptView(Number(parts[1]));
+    if (parts[0] === 'attempt') return await attemptView(Number(parts[1]), params);
+    if (parts[0] === 'writing') return await writingView(params);
     if (parts[0] === 'vocab' && parts[1] === 'screen') return await vocabScreen();
     if (parts[0] === 'vocab' && parts[1] === 'review') return await vocabQuizRun();
     if (parts[0] === 'vocab' && parts[1] === 'quiz') return await vocabQuizRun({ free: true, params });
@@ -502,7 +503,7 @@ function renderWriting(session) {
   };
 }
 
-function writingFeedback(fb, text) {
+function writingFeedback(fb, text, { openText = false } = {}) {
   const list = (v, fn) => { const arr = asList(v); return arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>'; };
   const strengths = asList(fb.strengths_zh);
   const upgrade = asList(fb.upgrade);
@@ -514,7 +515,7 @@ function writingFeedback(fb, text) {
     ${upgrade.length ? `<h3>可以換成更精準的說法</h3>${list(upgrade, u => `<li><del>${esc(u.original)}</del><ins>${esc(u.better)}</ins></li>`)}` : ''}
     ${fb.next_focus_zh ? `<h3>下次練習的重點</h3><p>${esc(fb.next_focus_zh)}</p>` : ''}
     ${fb.model_answer ? `<details><summary>5 分範文（保留你的想法改寫）</summary><div class="card passage" style="margin-top:8px">${esc(fb.model_answer)}</div></details>` : ''}
-    ${text != null ? `<details><summary>你的原文</summary><div class="card passage" style="margin-top:8px">${esc(text)}</div></details>` : ''}
+    ${text != null ? `<details${openText ? ' open' : ''}><summary>你的原文（${words(text)} 字）</summary><div class="card passage" style="margin-top:8px">${esc(text)}</div></details>` : ''}
   </div>`;
 }
 
@@ -526,7 +527,7 @@ function verdict(r) {
   return `<div class="verdict"><span class="mark">${mark}</span><span class="muted">${note}</span></div>`;
 }
 
-function resultBody(type, content, feedback, response, given) {
+function resultBody(type, content, feedback, response, given, opts) {
   if (type === 'ctw') return `<div class="card ctw">${ctwMarkup(content.tokens, { result: feedback.detail, given: given || response.blanks || [] })}</div>`;
   if (type === 'rdl' || type === 'acad') return mcPassage(content) + mcResultMarkup(content, feedback.detail);
   if (type === 'bas') {
@@ -537,26 +538,86 @@ function resultBody(type, content, feedback, response, given) {
           : `<p><del style="color:var(--red)">${esc((response.order || []).join(' '))}</del></p><p><b>${esc(d.answer)}${esc(content.end)}</b></p>`}
         ${d.explain_zh ? `<div class="explain small">${esc(d.explain_zh)}</div>` : ''}</div>`;
   }
-  return writingFeedback(feedback, response.text);
+  return writingFeedback(feedback, response.text, opts);
 }
+
+const WRITING = ['email', 'disc'];
+const WLABEL = { email: '信件', disc: '學術討論' }; // short names for the writing record
 
 function showResult(session, r, response) {
   setView(`${topBar(session)}<main>${verdict(r)}${ratingDelta(r)}
     ${resultBody(session.type, session.item.content, r.feedback, response, session.given)}
+    ${WRITING.includes(session.type) ? `<p style="margin-top:16px"><a class="link small" href="#/writing?type=${session.type}">看過去的${WLABEL[session.type]}紀錄</a></p>` : ''}
     ${afterResultButtons(session)}</main>`, { focus: true });
   document.getElementById('timer').textContent = '';
   wireNext(session);
 }
 
-async function attemptView(id) {
+async function attemptView(id, params = new URLSearchParams()) {
   setView(loading(), { tab: 'progress' });
   const a = await api(`/api/attempt?id=${id}`);
   const r = { type: a.type, raw: a.raw_score, max: a.max_score, score: a.score };
-  setView(`<main><p><a class="link" href="#/progress">← 進度</a></p>
+  const writing = WRITING.includes(a.type);
+  const from = params.get('from');
+  const back = from === 'writing' ? `<a class="link" href="#/writing${params.get('t') ? `?type=${encodeURIComponent(params.get('t'))}` : ''}">← 寫作紀錄</a>`
+    : '<a class="link" href="#/progress">← 進度</a>';
+  setView(`<main><p>${back}</p>
     <h2>${esc(META.tasks[a.type].zh)}</h2><p class="muted small">${esc(a.day)}・${fmtTime(a.seconds || 0)}</p>
-    ${a.type === 'email' || a.type === 'disc' ? writingPrompt(a.type, a.item.content) : ''}
-    ${verdict(r)}${resultBody(a.type, a.item.content, a.feedback, a.response)}
-    <a class="btn ghost block" style="margin-top:24px" href="#/practice/${a.type}?n=1">再練一題</a></main>`, { tab: 'progress' });
+    ${writing ? `<details class="prompt-wrap"><summary>題目</summary>${writingPrompt(a.type, a.item.content)}</details>` : ''}
+    ${verdict(r)}${resultBody(a.type, a.item.content, a.feedback, a.response, undefined, { openText: true })}
+    <div class="row" style="margin-top:24px">
+      ${writing ? `<a class="btn ghost block" href="#/writing?type=${a.type}">全部紀錄</a>` : ''}
+      <a class="btn ghost block" href="#/practice/${a.type}?n=1">再練一題</a></div></main>`, { tab: 'progress' });
+}
+
+// ---------- Writing record (email / academic discussion) ----------
+function writingRow(w, filter) {
+  return `<a class="wcard" href="#/attempt/${w.id}?from=writing${filter ? `&t=${filter}` : ''}">
+    <div class="row"><span class="wtype">${WLABEL[w.type]}</span>
+      <span class="muted small spacer">${esc(w.day)}・${w.words} 字・${fmtTime(w.seconds || 0)}</span>
+      <b class="wscore">${fmtBand(w.score)}<small>/5</small></b></div>
+    <p class="wprompt">${w.meta ? `<span class="muted">${esc(w.meta)}｜</span>` : ''}${esc(w.prompt)}</p>
+    ${w.answer ? `<p class="wanswer">${esc(w.answer)}</p>` : '<p class="wanswer muted">（沒有作答內容）</p>'}
+    ${w.summary ? `<p class="wsummary">${esc(w.summary)}</p>` : ''}
+  </a>`;
+}
+
+async function writingView(params) {
+  const filter = WRITING.includes(params.get('type')) ? params.get('type') : '';
+  setView(loading(), { tab: 'progress' });
+  const d = await api(`/api/writing${filter ? `?type=${filter}` : ''}`);
+  const stat = t => {
+    const s = d.stats[t];
+    return `<div><b>${s.n ? fmtBand(s.recentAvg) : '—'}</b><span>${WLABEL[t]}・近 5 次平均</span>
+      <span class="muted small">${s.n ? `共 ${s.n} 篇・最高 ${fmtBand(s.best)}` : '還沒寫過'}</span></div>`;
+  };
+  const shown = filter ? [filter] : WRITING;
+  const trends = shown.filter(t => d.stats[t].trend.length > 1)
+    .map(t => `<p class="muted small" style="margin-bottom:4px">${WLABEL[t]}分數走勢（換算成 1–6 級分）</p>
+      ${sparkline(d.stats[t].trend.map(s => 1 + s), d.target, `${WLABEL[t]}分數走勢`)}`).join('');
+  const seg = [['', '全部'], ['email', WLABEL.email], ['disc', WLABEL.disc]]
+    .map(([t, label]) => `<a href="#/writing${t ? `?type=${t}` : ''}" class="${t === filter ? 'on' : ''}"${t === filter ? ' aria-current="page"' : ''}>${esc(label)}</a>`).join('');
+  setView(`<main class="stack">
+    <p><a class="link" href="#/progress">← 進度</a></p>
+    <h2>寫作紀錄</h2>
+    <div class="wstats">${stat('email')}${stat('disc')}</div>
+    ${trends}
+    <nav class="seg" aria-label="篩選題型">${seg}</nav>
+    <div id="wlist">${d.items.map(w => writingRow(w, filter)).join('') || '<p class="muted">還沒有紀錄。寫完一篇並送出批改後會出現在這裡。</p>'}</div>
+    ${d.more ? '<button class="btn ghost block" id="wmore">載入更多</button>' : ''}
+    <div class="row">${shown.map(t => `<a class="btn block" href="#/practice/${t}?n=1">練習${WLABEL[t]}</a>`).join('')}</div>
+  </main>`, { tab: 'progress' });
+  let next = d.next;
+  const more = document.getElementById('wmore');
+  if (more) more.onclick = async () => {
+    more.disabled = true; more.textContent = '載入中…';
+    try {
+      const p = await api(`/api/writing?before=${next}${filter ? `&type=${filter}` : ''}`);
+      document.getElementById('wlist').insertAdjacentHTML('beforeend', p.items.map(w => writingRow(w, filter)).join(''));
+      next = p.next;
+      if (p.more) { more.disabled = false; more.textContent = '載入更多'; } else more.remove();
+    } catch (e) { more.disabled = false; more.textContent = `載入失敗，再試一次（${e.message}）`; }
+  };
 }
 
 // ---------- Vocabulary ----------
@@ -857,13 +918,13 @@ async function vocabQuizRun({ free = false, params = new URLSearchParams() } = {
 }
 
 // ---------- Progress ----------
-function sparkline(points, target) {
+function sparkline(points, target, label = '整體能力估計趨勢') {
   if (points.length < 2) return '';
   const W = 640, H = 140, P = 8;
   const x = i => P + (i / (points.length - 1)) * (W - 2 * P);
   const y = v => H - P - ((v - 1) / 5) * (H - 2 * P);
   const d = points.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="整體能力估計趨勢">
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">
     <line x1="${P}" x2="${W - P}" y1="${y(target)}" y2="${y(target)}" stroke="var(--red)" stroke-dasharray="4 4"/>
     <text x="${W - P}" y="${y(target) - 6}" text-anchor="end" fill="var(--red)" font-size="14">目標 ${fmtBand(target)}</text>
     <path d="${d}" fill="none" stroke="var(--ink)" stroke-width="2.5" stroke-linejoin="round"/></svg>`;
@@ -894,6 +955,8 @@ async function progressView() {
     <p class="muted small">1–6 級分估計，紅線是目標 ${fmtBand(target)}。點題型可以額外練習。</p>
     <div>${rows}</div>
     ${trend.length > 1 ? `<h2>整體趨勢</h2>${sparkline(trend.slice(-60), target)}` : ''}
+    <div class="sheet"><a class="task" href="#/writing"><div class="spacer"><div class="name">寫作紀錄</div>
+      <div class="sub">過去的信件與學術討論作答、分數和批改</div></div><span class="muted">›</span></a></div>
     <h2>最近的練習</h2>
     ${hist ? `<ul class="hist">${hist}</ul>` : '<p class="muted">還沒有練習紀錄。從「今天」的診斷開始。</p>'}
   </main>`, { tab: 'progress' });

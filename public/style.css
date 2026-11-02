@@ -206,6 +206,29 @@ summary { cursor: pointer; font-weight: 700; }
 .hist a { display: flex; gap: 10px; padding: 10px 0; border-top: 1px solid var(--rule); text-decoration: none; }
 .chart { width: 100%; height: auto; display: block; }
 
+/* ---------- Writing record ---------- */
+.wstats { display: grid; grid-template-columns: 1fr 1fr; border-top: 1.5px solid var(--ink); border-bottom: 1px solid var(--rule); }
+.wstats div { padding: 10px 6px; text-align: center; display: flex; flex-direction: column; gap: 2px; }
+.wstats div + div { border-left: 1px solid var(--rule); }
+.wstats b { font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+.wstats span { font-size: .8rem; color: var(--graphite); }
+.seg { display: flex; border: 1px solid var(--rule); border-radius: var(--radius-s); overflow: hidden; }
+.seg a { flex: 1; text-align: center; padding: 10px 4px; text-decoration: none; color: var(--graphite); font-weight: 700; }
+.seg a + a { border-left: 1px solid var(--rule); }
+.seg a.on { background: var(--ink); color: var(--card); }
+.wcard { display: block; padding: 14px 0; border-top: 1px solid var(--rule); text-decoration: none; color: inherit; }
+.wcard .row { align-items: baseline; gap: 8px; }
+.wtype { font-weight: 700; white-space: nowrap; }
+.wscore { font-size: 1.15rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wscore small { color: var(--graphite); font-weight: 400; }
+.wcard p { margin: 6px 0 0; overflow-wrap: anywhere; }
+.wprompt { font-size: .9rem; }
+.wanswer { font-style: italic; color: var(--graphite); font-size: .92rem; }
+.wsummary { font-size: .9rem; border-left: 3px solid var(--rule); padding-left: 8px; }
+.prompt-wrap { margin: 12px 0; }
+.prompt-wrap summary { cursor: pointer; font-weight: 700; }
+.prompt-wrap .prompt-box { margin-top: 8px; }
+
 /* ---------- Forms ---------- */
 label.field { display: block; margin-top: 14px; }
 label.field span { display: block; font-size: .9rem; color: var(--graphite); margin-bottom: 4px; }

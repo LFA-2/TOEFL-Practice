@@ -81,6 +81,30 @@ await step('writing task graded by (mock) AI and charged to the quota', async ()
   assert.ok(me.usage.used >= 1, `used ${me.usage.used}`);
 });
 
+await step('writing record lists past email / discussion answers with feedback, paged', async () => {
+  const disc = (await a('/next?type=disc')).data;
+  const r = await a('/submit', { itemId: disc.id, response: { text: 'I think online classes help students because they can review lectures.' }, seconds: 500 });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  await idle();
+  const all = (await a('/writing')).data;
+  assert.equal(all.items.length, 2, JSON.stringify(all));
+  assert.equal(all.items[0].type, 'disc'); // newest first
+  assert.equal(all.items[1].type, 'email');
+  assert.equal(all.items[0].words, 11);
+  assert.ok(all.items[0].prompt && all.items[0].summary, 'prompt and summary preview');
+  assert.equal(all.stats.email.n, 1); assert.equal(all.stats.disc.n, 1);
+  assert.equal(all.stats.disc.recentAvg, 3.5);
+  assert.equal(typeof all.target, 'number');
+  const email = (await a('/writing?type=email')).data;
+  assert.deepEqual(email.items.map(x => x.type), ['email']);
+  const page2 = (await a(`/writing?before=${all.items[0].id}`)).data;
+  assert.deepEqual(page2.items.map(x => x.id), [all.items[1].id]);
+  assert.equal(page2.more, false);
+  const full = (await a(`/attempt?id=${all.items[0].id}`)).data;
+  assert.equal(full.response.text.startsWith('I think'), true);
+  assert.equal(typeof full.feedback.summary_zh, 'string');
+});
+
 let screen;
 await step('vocab screening fills the pool via AI', async () => {
   const r = await a('/vocab/screen');
@@ -159,6 +183,9 @@ await step("another user cannot see or change the first user's data", async () =
   assert.equal(at.status, 404);
   const d = (await b('/dashboard')).data;
   assert.equal(d.recent.length, 0);
+  const w = (await b('/writing')).data;
+  assert.equal(w.items.length, 0, 'writing record is private');
+  assert.equal(w.stats.email.n, 0);
   // shared bank: generated items are visible to b
   assert.ok(d.stock.find(s => s.type === 'email').total >= 2);
 });
