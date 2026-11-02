@@ -306,8 +306,8 @@ function renderMc(session) {
   const picks = new Array(c.questions.length).fill(null);
   const qs = c.questions.map((q, qi) => `<div class="q"><div class="stem">${qi + 1}. ${esc(q.q)}</div>
     ${q.options.map((o, oi) => `<button class="opt" data-q="${qi}" data-o="${oi}"><span class="letter">${LETTERS[oi]}</span><span>${esc(o)}</span></button>`).join('')}</div>`).join('');
-  setView(`${topBar(session)}<main>${mcPassage(c)}${qs}
-    <button class="btn block" id="submit" style="margin-top:24px" disabled>送出</button></main>`, { focus: true });
+  setView(`${topBar(session)}<main class="split"><div class="pane-l">${mcPassage(c)}</div>
+    <div class="pane-r">${qs}<button class="btn block" id="submit" style="margin-top:24px" disabled>送出</button></div></main>`, { focus: true });
   const submit = document.getElementById('submit');
   $app.querySelectorAll('.opt').forEach(b => b.onclick = () => {
     const qi = Number(b.dataset.q);
@@ -377,12 +377,12 @@ function writingPrompt(type, c) {
 function renderWriting(session) {
   const { type, item } = session;
   const key = `draft:${item.id}`;
-  setView(`${topBar(session)}<main class="stack">
-    ${writingPrompt(type, item.content)}
+  setView(`${topBar(session)}<main class="split"><div class="pane-l">${writingPrompt(type, item.content)}</div>
+    <div class="pane-r stack">
     <textarea id="text" placeholder="${type === 'email' ? 'Dear …' : '在這裡寫你的回應'}" autocapitalize="sentences" spellcheck="false"></textarea>
     <div class="row"><span class="muted small" id="wc">0 字</span><span class="spacer"></span>
       <button class="btn" id="submit">送出批改</button></div>
-    <p class="muted small">正式考試${type === 'email' ? ' 7' : ' 10'} 分鐘。超時可以照樣送出，計時器會變紅提醒你。拼字檢查已關閉，跟考場一樣。</p></main>`, { focus: true });
+    <p class="muted small">正式考試${type === 'email' ? ' 7' : ' 10'} 分鐘。超時可以照樣送出，計時器會變紅提醒你。拼字檢查已關閉，跟考場一樣。</p></div></main>`, { focus: true });
   const ta = document.getElementById('text');
   const wc = document.getElementById('wc');
   ta.value = store.get(key) || '';
@@ -418,7 +418,7 @@ function verdict(r) {
 
 function resultBody(type, content, feedback, response, given) {
   if (type === 'ctw') return `<div class="card ctw">${ctwMarkup(content.tokens, { result: feedback.detail, given: given || response.blanks || [] })}</div>`;
-  if (type === 'rdl' || type === 'acad') return mcPassage(content) + mcResultMarkup(content, feedback.detail);
+  if (type === 'rdl' || type === 'acad') return `<div class="split-inner"><div class="pane-l">${mcPassage(content)}</div><div class="pane-r">${mcResultMarkup(content, feedback.detail)}</div></div>`;
   if (type === 'bas') {
     const d = feedback.detail[0];
     return `<div class="speech"><b>${esc(content.speaker || 'A')}</b>${esc(content.context)}</div>
@@ -553,6 +553,7 @@ async function vocabScreen() {
       </div>
       <p style="text-align:center;margin-top:18px">${history.length ? '<button class="link small" id="undo">上一個按錯了</button>' : ''}</p>
       <p class="muted small" style="text-align:center">「會」的字之後不會再出現。「不熟」和「不會」都會加進單字本。</p>
+      <p class="muted small kbd-hint" style="text-align:center">鍵盤：1 不會　2 不熟　3 會　Backspace 上一個</p>
     </main>`, { focus: true });
     document.getElementById('say').onclick = () => speak(w.word);
     const undo = document.getElementById('undo');
@@ -574,8 +575,8 @@ async function vocabScreen() {
   document.onkeydown = e => {
     if (!location.hash.startsWith('#/vocab/screen')) { document.onkeydown = null; return; }
     const map = { 1: 'unknown', 2: 'fuzzy', 3: 'known' };
-    const b = map[e.key] && $app.querySelector(`[data-how="${map[e.key]}"]`);
-    if (b) b.click();
+    const b = map[e.key] ? $app.querySelector(`[data-how="${map[e.key]}"]`) : e.key === 'Backspace' ? document.getElementById('undo') : null;
+    if (b) { e.preventDefault(); b.click(); }
   };
   show();
 }
@@ -623,6 +624,7 @@ async function vocabReview() {
       <div class="vword"><span>${esc(w.word)}</span><button class="link small" id="say">發音</button></div>
       <div id="back"></div>
       <div class="vbtns" id="btns"><button class="btn block" id="reveal">看答案</button></div>
+      <p class="muted small kbd-hint" style="text-align:center">鍵盤：空白鍵看答案，再按 1 忘了　2 模糊　3 記得</p>
     </main>`, { focus: true });
     document.getElementById('say').onclick = () => speak(w.word);
     document.getElementById('reveal').onclick = () => {
@@ -641,6 +643,7 @@ async function vocabReview() {
       <div class="card ctw" id="spell">${p.inSentence ? `${esc(p.before)}${boxes}${esc(p.after)}` : `<div style="text-align:center">${boxes}</div>`}</div>
       <div id="back"></div>
       <div class="vbtns" id="btns"><button class="btn block" id="check">檢查拼字</button></div>
+      <p class="muted small kbd-hint" style="text-align:center">鍵盤：直接打字，Enter 檢查，再按 Enter 下一個</p>
     </main>`, { focus: true });
     const read = wireLetterBoxes(document.getElementById('spell'), () => document.getElementById('check').click());
     document.querySelector('#spell .lb-cell')?.focus();
@@ -659,6 +662,15 @@ async function vocabReview() {
     };
   };
 
+  document.onkeydown = e => {
+    if (!location.hash.startsWith('#/vocab/review')) { document.onkeydown = null; return; }
+    if (e.target.matches?.('input, textarea')) return;
+    const reveal = document.getElementById('reveal');
+    if (reveal && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); reveal.click(); return; }
+    const map = { 1: 'again', 2: 'hard', 3: 'good' };
+    const b = map[e.key] && $app.querySelector(`[data-r="${map[e.key]}"]:not(:disabled)`);
+    if (b) { e.preventDefault(); b.click(); }
+  };
   if (!data.items.length && !data.waitingForCards) {
     setView(`${vocabTop('單字複習', prog())}<main class="stack" style="padding-top:12vh"><h2>現在沒有要複習的字</h2>
       <a class="btn block" href="#/vocab/screen">去挑新單字</a></main>`, { focus: true });

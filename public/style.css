@@ -87,7 +87,7 @@ p { margin: 0 0 .8em; }
 
 /* ---------- Practice ---------- */
 .ptop { position: sticky; top: 0; z-index: 5; background: var(--paper); display: flex; align-items: center; gap: 12px;
-  padding: 10px 16px; border-bottom: 1px solid var(--rule); max-width: 680px; margin: 0 auto; }
+  padding: 10px max(16px, calc(50% - 324px)); border-bottom: 1px solid var(--rule); }
 .ptop .title { font-weight: 700; }
 .timer { font-variant-numeric: tabular-nums; font-weight: 700; }
 .timer.over { color: var(--red); }
@@ -207,7 +207,32 @@ nav.tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; backgroun
   display: flex; justify-content: center; padding-bottom: env(safe-area-inset-bottom); }
 nav.tabs a { flex: 1; max-width: 180px; text-align: center; padding: 12px 0 14px; text-decoration: none; color: var(--graphite); font-weight: 700; }
 nav.tabs a.on { color: var(--ink); box-shadow: inset 0 3px 0 var(--ink); }
+nav.tabs .brand { display: none; }
 body.focus nav.tabs { display: none; }
+.kbd-hint { display: none; }
+@media (hover: hover) and (pointer: fine) { .kbd-hint { display: block; } }
+.split-inner > .pane-r > .q:first-child { margin-top: 22px; }
+
+/* ---------- Wide screens: top navigation, two-pane test layout like the real computer test ---------- */
+@media (min-width: 960px) {
+  body { padding-bottom: 0; padding-top: 57px; }
+  body.focus { padding-top: 0; }
+  nav.tabs { top: 0; bottom: auto; border-top: 0; border-bottom: 1px solid var(--rule); justify-content: flex-start; align-items: center;
+    padding: 0 max(16px, calc(50% - 340px)); background: var(--paper); }
+  nav.tabs .brand { display: block; font-weight: 700; margin-right: auto; }
+  nav.tabs a { flex: 0 0 auto; padding: 16px 16px 15px; }
+  nav.tabs a.on { box-shadow: inset 0 -3px 0 var(--ink); }
+  main.split, .ptop:has(+ main.split) { --wide: 1180px; }
+  .ptop:has(+ main.split) { padding-inline: max(16px, calc(50% - 574px)); }
+  main.split { max-width: 1180px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 40px; align-items: start; }
+  main.split > .pane-l { position: sticky; top: 72px; max-height: calc(100vh - 92px); overflow: auto; }
+  main.split > .pane-r > .q:first-child { margin-top: 0; }
+  main.split textarea { min-height: 62vh; }
+  main:has(.split-inner) { max-width: 1180px; }
+  .split-inner { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 40px; align-items: start; }
+  .split-inner > .pane-l { position: sticky; top: 72px; }
+  .split-inner > .pane-r > .q:first-child { margin-top: 0; }
+}
 body.focus { padding-bottom: 0; }
 
 .loading { padding: 48px 0; text-align: center; color: var(--graphite); }
