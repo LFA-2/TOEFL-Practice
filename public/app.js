@@ -57,9 +57,10 @@ async function route() {
     if (parts[0] === 'practice') return await practice(parts[1], params);
     if (parts[0] === 'attempt') return await attemptView(Number(parts[1]));
     if (parts[0] === 'vocab' && parts[1] === 'screen') return await vocabScreen();
-    if (parts[0] === 'vocab' && parts[1] === 'review') return await vocabReview();
+    if (parts[0] === 'vocab' && parts[1] === 'review') return await vocabQuizRun();
+    if (parts[0] === 'vocab' && parts[1] === 'quiz') return await vocabQuizRun({ free: true, params });
     if (parts[0] === 'vocab' && parts[1] === 'known') return await vocabKnown();
-    if (parts[0] === 'vocab') return await vocabHome();
+    if (parts[0] === 'vocab') return await vocabHome(params);
     if (parts[0] === 'progress') return await progressView();
     if (parts[0] === 'settings') return await settingsView();
     return await todayView();
@@ -481,25 +482,32 @@ function cardBack(w) {
   </div>`;
 }
 
-async function vocabHome() {
+async function vocabHome(params = new URLSearchParams()) {
   setView(loading(), { tab: 'vocab' });
-  const [{ plan }, book] = await Promise.all([api('/api/today'), api('/api/vocab/list')]);
-  const v = plan.vocab;
-  const vocabDone = v.screen.done >= v.screen.target && !v.review.due; const s = book.stats;
-  const rows = book.words.map(w => `<details class="wrow"><summary><b>${esc(w.word)}</b><span class="spacer"></span>
+  const onlyHard = params.get('hard') === '1';
+  const [{ plan }, book] = await Promise.all([api('/api/today'), api(`/api/vocab/list${onlyHard ? '?hard=1' : ''}`)]);
+  const v = plan.vocab; const s = book.stats;
+  const rows = book.words.map(w => `<details class="wrow"><summary><b>${esc(w.word)}</b>${w.hard ? '<span class="tag">難字</span>' : ''}<span class="spacer"></span>
       <span class="muted small">${esc(w.card?.zh || '')}</span><span class="muted small due">${dueLabel(w.due_day)}</span></summary>
       ${w.card ? cardBack(w) : '<p class="muted small">單字卡準備中</p>'}</details>`).join('');
   setView(`<main class="stack">
-    <div class="vstats"><div><b>${s.learning}</b><span>學習中</span></div><div><b>${s.mature}</b><span>已熟練</span></div><div><b>${s.known}</b><span>本來就會</span></div></div>
+    <div class="vstats"><div><b>${s.learning}</b><span>學習中</span></div><div><b>${s.mature}</b><span>已熟練</span></div>
+      <div><b>${s.hard}</b><span>難字</span></div><div><b>${s.known}</b><span>本來就會</span></div></div>
     <div class="sheet">
       <a class="task ${v.screen.done < v.screen.target ? 'next' : 'complete'}" href="#/vocab/screen"><div class="spacer"><div class="name">挑新單字</div>
         <div class="sub">今天 ${v.screen.done} / ${v.screen.target} 個</div></div></a>
       <a class="task ${v.review.due ? '' : 'complete'}" href="#/vocab/review"><div class="spacer"><div class="name">複習</div>
         <div class="sub">${v.review.due ? `還有 ${v.review.due} 個到期` : '今天沒有到期的單字'}</div></div></a>
+      <a class="task" href="#/vocab/quiz"><div class="spacer"><div class="name">自由測驗</div>
+        <div class="sub">從單字本抽 20 個，偏重常錯的字</div></div></a>
+      ${s.hard ? `<a class="task" href="#/vocab/quiz?hard=1"><div class="spacer"><div class="name">只考難字</div>
+        <div class="sub">${s.hard} 個常錯的字</div></div></a>` : ''}
     </div>
-    <div class="row"><h2 class="spacer">單字本</h2><a class="link small" href="#/vocab/known">本來就會的字</a></div>
-    ${rows ? `<div>${rows}</div>` : '<p class="muted">還沒有要背的字。先去「挑新單字」。</p>'}
-    <p class="muted small">「學習中」的字會依照第 1、2、4、7、14、21 天的間隔複習；連續答對升到第 7 天以上算熟練。</p>
+    <div class="row"><h2 class="spacer">單字本</h2>
+      <a class="link small" href="${onlyHard ? '#/vocab' : '#/vocab?hard=1'}">${onlyHard ? '顯示全部' : '只看難字'}</a>
+      <a class="link small" href="#/vocab/known">本來就會的字</a></div>
+    ${rows ? `<div>${rows}</div>` : `<p class="muted">${onlyHard ? '目前沒有難字。' : '還沒有要背的字。先去「挑新單字」。'}</p>`}
+    <p class="muted small">複習間隔是第 1、2、4、7、14、21、45、90 天。答對往下一個間隔，用了提示或打成近義字維持原間隔，答錯明天重來。升到第 7 天以上算熟練；累計錯 4 次以上標為難字。自由測驗答錯會拉回明天，答對不會提前往後推。</p>
   </main>`, { tab: 'vocab' });
 }
 
@@ -580,87 +588,153 @@ async function vocabScreen() {
   show();
 }
 
-function spellParts(w) {
-  const word = w.word;
-  const keep = Math.max(1, Math.floor(word.length / 2));
-  const ex = w.card?.example || '';
-  const m = ex.match(new RegExp(`\\b${word}\\b`, 'i'));
-  return { prefix: word.slice(0, keep), rest: word.slice(keep), before: m ? ex.slice(0, m.index) : '', after: m ? ex.slice(m.index + word.length) : '', inSentence: !!m };
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
 }
 
-async function vocabReview() {
-  setView(`${vocabTop('單字複習', '')}${loading('載入')}`, { focus: true });
-  let data = await api('/api/vocab/review');
+// Split a sentence around the target word (exact spelling); null if it does not occur.
+function aroundWord(sentence, word) {
+  const m = (sentence || '').match(new RegExp(`\\b${word}\\b`, 'i'));
+  return m ? { before: sentence.slice(0, m.index), after: sentence.slice(m.index + m[0].length) } : null;
+}
+
+// One quiz session. `free` = free quiz (fixed list, wrong answers only push words back).
+async function vocabQuizRun({ free = false, params = new URLSearchParams() } = {}) {
+  const title = free ? (params.get('hard') === '1' ? '難字測驗' : '自由測驗') : '單字複習';
+  const url = free ? `/api/vocab/quiz?n=20${params.get('hard') === '1' ? '&hard=1' : ''}` : '/api/vocab/review';
+  const home = free ? '#/vocab/quiz' : '#/vocab/review';
+  setView(`${vocabTop(title, '')}${loading('準備題目')}`, { focus: true });
+  let data = await api(url);
   let i = 0;
-  const prog = () => `${data.done} / ${data.target}`;
+  const results = [];
+  const prog = () => (free ? `${Math.min(i + 1, data.items.length)} / ${data.items.length}` : `${data.done} / ${data.target}`);
+
+  const finish = () => {
+    const wrong = results.filter(r => r.result === 'again');
+    const right = results.length - wrong.length;
+    const list = wrong.length ? `<h3>答錯的字</h3><ul class="fix-list">${wrong.map(r => `<li><b>${esc(r.word)}</b>　<span class="muted">${esc(r.zh)}</span></li>`).join('')}</ul>` : '';
+    setView(`${vocabTop(title, '')}<main class="stack" style="padding-top:8vh">
+      <h2>${free ? `答對 ${right} / ${results.length}` : '今天的複習完成了'}</h2>
+      <p>${free ? '答錯的字明天會回到複習。' : '答錯的字明天會再出現。'}</p>${list}
+      <a class="btn block" href="#/">回到今天</a>
+      ${free ? '<button class="btn ghost block" id="again">再考一輪</button>' : ''}
+      <a class="btn ghost block" href="#/vocab">單字本</a></main>`, { focus: true });
+    const again = document.getElementById('again');
+    if (again) again.onclick = () => vocabQuizRun({ free, params }).catch(errorView);
+  };
 
   const next = async () => {
     if (i >= data.items.length) {
-      data = await api('/api/vocab/review'); i = 0;
+      if (free) return finish();
+      data = await api(url); i = 0;
       if (!data.items.length && data.waitingForCards) {
-        setView(`${vocabTop('單字複習', prog())}${loading(`單字卡準備中（${data.waitingForCards} 個）`)}`, { focus: true });
+        setView(`${vocabTop(title, prog())}${loading(`題目準備中（${data.waitingForCards} 個）`)}`, { focus: true });
         setTimeout(() => next().catch(errorView), 3000);
         return;
       }
-      if (!data.items.length) {
-        setView(`${vocabTop('單字複習', prog())}<main class="stack" style="padding-top:12vh"><h2>今天的複習完成了</h2>
-          <p>答錯的字明天會再出現。</p><a class="btn block" href="#/">回到今天</a><a class="btn ghost block" href="#/vocab">單字本</a></main>`, { focus: true });
-        return;
-      }
+      if (!data.items.length) return results.length ? finish() : setView(`${vocabTop(title, '')}<main class="stack" style="padding-top:12vh">
+        <h2>現在沒有要複習的字</h2><a class="btn block" href="#/vocab/screen">去挑新單字</a><a class="btn ghost block" href="#/vocab/quiz">自由測驗</a></main>`, { focus: true });
     }
     const w = data.items[i];
-    (w.mode === 'spell' ? spellCard : recallCard)(w);
+    (w.mode === 'type' ? typeQ : choiceQ)(w);
   };
 
   const send = async (w, result) => {
-    const r = await api('/api/vocab/grade', { id: w.id, mode: w.mode, result });
-    data.done = r.done; data.target = r.target;
+    results.push({ word: w.word, zh: w.card.zh, result });
+    const r = await api('/api/vocab/grade', { id: w.id, mode: w.mode, result, free });
+    if (!free) { data.done = r.done; data.target = r.target; }
     i++; next().catch(errorView);
   };
 
-  const recallCard = w => {
-    setView(`${vocabTop('單字複習', prog())}<main class="vscreen">
-      <div class="vword"><span>${esc(w.word)}</span><button class="link small" id="say">發音</button></div>
-      <div id="back"></div>
-      <div class="vbtns" id="btns"><button class="btn block" id="reveal">看答案</button></div>
-    </main>`, { focus: true });
-    document.getElementById('say').onclick = () => speak(w.word);
-    document.getElementById('reveal').onclick = () => {
-      document.getElementById('back').innerHTML = cardBack(w);
-      document.getElementById('btns').innerHTML = `<button class="btn ghost" data-r="again">忘了</button>
-        <button class="btn ghost" data-r="hard">模糊</button><button class="btn" data-r="good">記得</button>`;
-      $app.querySelectorAll('[data-r]').forEach(b => b.onclick = () => { $app.querySelectorAll('[data-r]').forEach(x => { x.disabled = true; }); send(w, b.dataset.r).catch(errorView); });
-    };
+  const nextButton = (w, result, label) => {
+    document.getElementById('btns').innerHTML = `<button class="btn block" id="go">${label}</button>`;
+    const go = document.getElementById('go');
+    go.onclick = () => { go.disabled = true; send(w, result).catch(errorView); };
+    go.focus();
   };
 
-  const spellCard = w => {
-    const p = spellParts(w);
-    const boxes = letterBoxes(p.prefix, p.rest.length, 0, '缺少的字母');
-    setView(`${vocabTop('單字複習', prog())}<main class="vscreen">
-      <p class="vzh" style="text-align:center"><span class="pos">${esc(w.card.pos || '')}</span>${esc(w.card.zh)}</p>
-      <div class="card ctw" id="spell">${p.inSentence ? `${esc(p.before)}${boxes}${esc(p.after)}` : `<div style="text-align:center">${boxes}</div>`}</div>
-      <div id="back"></div>
-      <div class="vbtns" id="btns"><button class="btn block" id="check">檢查拼字</button></div>
-    </main>`, { focus: true });
+  // ---- fill-in-the-blank, four options ----
+  const choiceQ = w => {
+    const q = w.card.quiz;
+    const options = shuffle([{ w: w.word, ok: true }, ...q.distractors.map(d => ({ ...d, ok: false }))]);
+    const [before, after] = q.sentence.split('___');
+    setView(`${vocabTop(title, prog())}<main class="vscreen">
+      <p class="muted small">選出最適合放進空格的字。</p>
+      ${w.firstTime ? `<p class="hint-zh">新字提示：<b>${esc(w.card.zh)}</b> <span class="pos">${esc(w.card.pos || '')}</span></p>` : ''}
+      <div class="card qsent">${esc(before)}<span class="gap" id="gap">______</span>${esc(after ?? '')}</div>
+      <div id="opts">${options.map((o, k) => `<button class="opt" data-k="${k}"><span class="letter">${LETTERS[k]}</span><span>${esc(o.w)}</span></button>`).join('')}</div>
+      <div id="back"></div><div class="vbtns" id="btns"></div>
+      <p class="muted small kbd-hint" style="text-align:center">鍵盤：1–4 選答案，Enter 下一題</p></main>`, { focus: true });
+    $app.querySelectorAll('#opts .opt').forEach(b => b.onclick = () => {
+      if ($app.querySelector('#opts .opt.correct')) return; // already answered
+      const pick = options[Number(b.dataset.k)];
+      $app.querySelectorAll('#opts .opt').forEach((x, k) => {
+        const o = options[k];
+        x.classList.add(o.ok ? 'correct' : (x === b ? 'missed' : 'dim'));
+        x.disabled = true;
+        if (!o.ok && o.why_zh) x.insertAdjacentHTML('beforeend', `<span class="why">${esc(o.why_zh)}</span>`);
+      });
+      document.getElementById('gap').textContent = w.word;
+      document.getElementById('gap').classList.add(pick.ok ? 'right' : 'wrongtxt');
+      speak(w.word);
+      document.getElementById('back').innerHTML = cardBack(w);
+      nextButton(w, pick.ok ? 'good' : 'again', pick.ok ? '答對了，下一題' : '答錯了，下一題');
+    });
+  };
+
+  // ---- Chinese -> type the whole word ----
+  const typeQ = w => {
+    const c = w.card;
+    const ctx = aroundWord(c.example, w.word);
+    const boxes = letterBoxes('', w.word.length, 0, `${w.word.length} 個字母`);
+    let hinted = false;
+    setView(`${vocabTop(title, prog())}<main class="vscreen">
+      <p class="muted small">看中文，拼出完整的英文單字（${w.word.length} 個字母）。</p>
+      <p class="vzh" style="text-align:center"><span class="pos">${esc(c.pos || '')}</span>${esc(c.zh)}</p>
+      <div class="card ctw" id="spell">${ctx ? `${esc(ctx.before)}${boxes}${esc(ctx.after)}` : `<div style="text-align:center">${boxes}</div>`}</div>
+      <div id="note"></div><div id="back"></div>
+      <div class="vbtns" id="btns"><button class="btn ghost" id="hint">提示</button><button class="btn" id="check" style="grid-column: span 2">檢查</button></div>
+      <p class="muted small kbd-hint" style="text-align:center">鍵盤：直接打字，Enter 檢查，再按 Enter 下一題</p></main>`, { focus: true });
+    const cells = [...document.querySelectorAll('#spell .lb-cell')];
     const read = wireLetterBoxes(document.getElementById('spell'), () => document.getElementById('check').click());
-    document.querySelector('#spell .lb-cell')?.focus();
+    cells[0]?.focus();
+    document.getElementById('hint').onclick = e => {
+      hinted = true; cells[0].value = w.word[0]; cells[0].disabled = true; e.currentTarget.disabled = true;
+      document.getElementById('note').innerHTML = '<p class="muted small" style="text-align:center">用了提示，這題答對也只算「模糊」。</p>';
+      cells[1]?.focus();
+    };
     document.getElementById('check').onclick = () => {
-      const given = (read()[0] || '').toLowerCase();
-      const ok = given === p.rest.toLowerCase();
-      document.querySelectorAll('#spell .lb-cell').forEach((c, k) => {
-        const good = (c.value || '').toLowerCase() === p.rest[k].toLowerCase();
-        c.disabled = true; c.classList.toggle('bad', !good); if (!good) c.value = p.rest[k];
+      const given = (read()[0] || '').replace(/\s/g, '').toLowerCase();
+      const target = w.word.toLowerCase();
+      const near = [...(c.quiz?.synonyms || []), ...(c.family || []).map(f => String(f.w).toLowerCase())];
+      let result; let msg;
+      if (given === target) { result = hinted ? 'hard' : 'good'; msg = hinted ? '拼對了（用了提示）' : '拼對了'; }
+      else if (given && near.includes(given)) { result = 'hard'; msg = `「${given}」很接近，但這裡要的是 ${w.word}`; }
+      else { result = 'again'; msg = given ? '拼錯了' : '沒有作答'; }
+      cells.forEach((cell, k) => {
+        const ok = (cell.value || '').toLowerCase() === target[k];
+        cell.disabled = true; cell.value = w.word[k]; cell.classList.toggle('bad', !ok && result === 'again');
       });
       speak(w.word);
-      document.getElementById('back').innerHTML = `<p class="${ok ? 'right' : 'wrongtxt'}" style="text-align:center;font-size:1.4rem"><b>${esc(w.word)}</b></p>${cardBack(w)}`;
-      document.getElementById('btns').innerHTML = `<button class="btn block" id="go">${ok ? '拼對了，下一個' : '拼錯了，下一個'}</button>`;
-      document.getElementById('go').onclick = e => { e.currentTarget.disabled = true; send(w, ok ? 'good' : 'again').catch(errorView); };
-      document.getElementById('go').focus();
+      document.getElementById('note').innerHTML = '';
+      document.getElementById('back').innerHTML = `<p class="${result === 'again' ? 'wrongtxt' : 'right'}" style="text-align:center"><b>${esc(msg)}</b>
+        ${given && given !== target ? `<br><span class="muted small">你寫的：<s>${esc(given)}</s></span>` : ''}</p>${cardBack(w)}`;
+      nextButton(w, result, '下一題');
     };
   };
 
-  if (!data.items.length && !data.waitingForCards) {
-    setView(`${vocabTop('單字複習', prog())}<main class="stack" style="padding-top:12vh"><h2>現在沒有要複習的字</h2>
+  document.onkeydown = e => {
+    if (!location.hash.startsWith(home.split('?')[0])) { document.onkeydown = null; return; }
+    if (e.target.matches?.('input:not(:disabled), textarea')) return;
+    if (e.key === 'Enter') { const go = document.getElementById('go'); if (go) { e.preventDefault(); go.click(); } return; }
+    const opt = /^[1-4]$/.test(e.key) && $app.querySelector(`#opts .opt[data-k="${Number(e.key) - 1}"]:not(:disabled)`);
+    if (opt) { e.preventDefault(); opt.click(); }
+  };
+
+  if (free && !data.items.length) {
+    setView(`${vocabTop(title, '')}<main class="stack" style="padding-top:12vh"><h2>${data.waitingForCards ? '題目還在準備中，請稍後再試' : '單字本裡還沒有字'}</h2>
       <a class="btn block" href="#/vocab/screen">去挑新單字</a></main>`, { focus: true });
     return;
   }

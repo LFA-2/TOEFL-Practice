@@ -187,6 +187,16 @@ summary { cursor: pointer; font-weight: 700; }
 .wrow.flat { display: flex; align-items: center; }
 .wrow .vback { border-top: 0; padding-top: 6px; }
 
+/* Vocabulary quiz */
+.qsent { font-size: 1.1rem; line-height: 1.7; margin: 10px 0 6px; }
+.qsent .gap { display: inline-block; min-width: 5em; border-bottom: 2px solid var(--ink); text-align: center; font-weight: 700; }
+.hint-zh { background: var(--bubble); border-radius: var(--radius-s); padding: 8px 12px; }
+.opt { flex-wrap: wrap; }
+.opt .why { flex-basis: 100%; padding-left: 38px; font-size: .88rem; color: var(--graphite); }
+.opt.dim { opacity: .8; }
+.tag { font-size: .75rem; font-weight: 700; color: var(--red); border: 1px solid var(--red); border-radius: 4px; padding: 0 5px; margin-left: 6px; }
+.vstats { grid-template-columns: repeat(4, 1fr); }
+
 /* ---------- Progress ---------- */
 .skill-row { display: grid; grid-template-columns: 1fr 120px 44px; gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid var(--rule); text-decoration: none; }
 .meter { position: relative; height: 10px; background: var(--bubble); border-radius: 5px; }

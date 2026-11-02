@@ -118,13 +118,17 @@ const routes = {
 
   'GET /api/vocab/review': () => vocab.reviewQueue(30),
 
+  'GET /api/vocab/quiz': (req, res, url) =>
+    vocab.freeQuiz(Math.min(50, Math.max(5, Number(url.searchParams.get('n')) || 20)), url.searchParams.get('hard') === '1'),
+
   'POST /api/vocab/grade': async (req) => {
     const b = await readJson(req);
-    return vocab.grade(Number(b.id), b.mode === 'spell' ? 'spell' : 'recall', String(b.result));
+    return vocab.grade(Number(b.id), b.mode === 'type' ? 'type' : 'choice', String(b.result), b.free === true);
   },
 
   'GET /api/vocab/list': (req, res, url) => ({
-    words: vocab.list({ status: url.searchParams.get('status') === 'known' ? 'known' : 'learning', q: url.searchParams.get('q') || '' }),
+    words: vocab.list({ status: url.searchParams.get('status') === 'known' ? 'known' : 'learning', q: url.searchParams.get('q') || '',
+      onlyHard: url.searchParams.get('hard') === '1' }),
     stats: vocab.stats(),
   }),
 
