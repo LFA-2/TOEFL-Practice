@@ -29,7 +29,7 @@ async function callClaudeJson({ system, prompt, maxTokens = 2500, model = config
       max_tokens: maxTokens,
       system,
       tools: [{ name: 'submit', description: 'Submit the result as the JSON object described in the request.', input_schema: schema }],
-      tool_choice: { type: 'tool', name: 'submit' },
+      tool_choice: { type: 'auto' }, // some models reject forcing a tool; the text fallback in parseJson covers a plain reply
       messages: [{ role: 'user', content: `${prompt}\n\nSubmit the result by calling the submit tool.` }],
     }),
     signal: AbortSignal.timeout(120_000),
