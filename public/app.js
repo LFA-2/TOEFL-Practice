@@ -5,10 +5,13 @@ const $app = document.getElementById('app');
 const $tabs = document.getElementById('tabs');
 let META = null;
 let timerHandle = null;
+let answerTimer = null; // per-question countdown in the interview
 
 // ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const LETTERS = 'ABCD';
+// AI-made content may hold a single value where a list is expected (older saved items too).
+const asList = v => (Array.isArray(v) ? v : v === undefined || v === null || v === '' ? [] : [v]);
 const fmtBand = v => (v == null ? '—' : Number(v).toFixed(1));
 const fmtTime = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const words = t => (t.trim().match(/\S+/g) || []).length;
@@ -19,19 +22,98 @@ const store = {
 };
 
 class AuthError extends Error {}
+class PendingError extends Error {}
 
-async function api(path, body) {
-  const res = await fetch(path, body === undefined ? {} : {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-  });
-  if (res.status === 401 && path !== '/api/login') throw new AuthError();
+// ---------- Supabase auth (plain fetch, no SDK) ----------
+const CFG = window.TOEFL_CONFIG;
+const AUTH = `${CFG.supabaseUrl}/auth/v1`;
+const FN = `${CFG.supabaseUrl}/functions/v1/api`;
+const SESSION_KEY = 'toefl-auth';
+let ME = null; // { email, approved, usage, subjects, subject } once checked
+
+// ---------- subjects: TOEFL or 學測翻譯 ----------
+const SUBJECT_INFO = {
+  toefl: { name: 'TOEFL iBT', title: 'TOEFL Coach', desc: '閱讀、聽力、口說（打字版）、寫作、單字，依考試日排每天的練習。' },
+  gsat: { name: '學測翻譯', title: '學測翻譯練習', desc: '93–114 年考古題和 AI 新題，依大考中心原則批改，像家教一樣講解，並整理片語本。' },
+};
+const TABS = {
+  toefl: [['today', '#/', '今天'], ['vocab', '#/vocab', '單字'], ['progress', '#/progress', '進度'], ['settings', '#/settings', '設定']],
+  gsat: [['today', '#/', '今天'], ['bank', '#/gsat/bank', '題庫'], ['phrases', '#/gsat/phrases', '片語'], ['progress', '#/gsat/progress', '進度'], ['settings', '#/settings', '設定']],
+};
+let SUBJECT = null;
+function setSubject(subject) {
+  SUBJECT = subject;
+  const tabs = TABS[subject] || TABS.toefl;
+  $tabs.innerHTML = tabs.map(([key, href, label]) => `<a href="${href}" data-tab="${key}">${label}</a>`).join('');
+  document.title = SUBJECT_INFO[subject]?.title || 'TOEFL Coach';
+}
+
+const session = {
+  get() { try { return JSON.parse(store.get(SESSION_KEY)); } catch { return null; } },
+  set(s) { store.set(SESSION_KEY, JSON.stringify({ access_token: s.access_token, refresh_token: s.refresh_token, expires_at: s.expires_at, email: s.user?.email })); },
+  clear() { store.del(SESSION_KEY); ME = null; },
+};
+
+// Supabase Auth error messages, in Traditional Chinese.
+function authMessage(data, status) {
+  const m = String(data.msg || data.error_description || data.message || data.error || '');
+  if (/invalid login credentials|invalid_credentials/i.test(m)) return 'Email 或密碼錯誤。';
+  if (/already registered|already exists/i.test(m)) return '這個 Email 已經註冊過了，請直接登入。';
+  if (/password should be|weak/i.test(m)) return '密碼太短，至少需要 8 個字元。';
+  if (/email not confirmed/i.test(m)) return '這個 Email 還沒有確認，請先點信裡的確認連結。';
+  if (/invalid email|unable to validate email/i.test(m)) return 'Email 格式不正確。';
+  if (/rate limit|too many/i.test(m) || status === 429) return '嘗試太多次了，請稍後再試。';
+  if (/signups not allowed|signup is disabled/i.test(m)) return '目前不開放註冊。';
+  return m || `登入服務錯誤（HTTP ${status}）`;
+}
+
+async function authPost(path, body, token) {
+  let res;
+  try {
+    res = await fetch(AUTH + path, { method: 'POST', body: JSON.stringify(body),
+      headers: { apikey: CFG.publishableKey, 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+  } catch { throw new Error('無法連線，請確認網路後再試。'); }
   const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(authMessage(data, res.status));
+  return data;
+}
+
+let refreshing = null;
+async function accessToken() {
+  const s = session.get();
+  if (!s) return null;
+  if (s.expires_at * 1000 - 60_000 > Date.now()) return s.access_token;
+  // expired or about to: trade the refresh token for a new session (one request at a time)
+  refreshing = refreshing || authPost('/token?grant_type=refresh_token', { refresh_token: s.refresh_token })
+    .then(n => { session.set(n); return n.access_token; })
+    .catch(e => { if (!/無法連線/.test(e.message)) session.clear(); throw e; })
+    .finally(() => { refreshing = null; });
+  try { return await refreshing; } catch (e) { if (/無法連線/.test(e.message)) throw e; return null; }
+}
+
+// path keeps the old "/api/..." form; it maps onto the Edge Function.
+async function api(path, body) {
+  const token = await accessToken();
+  if (!token && path !== '/api/me') throw new AuthError();
+  let res;
+  try {
+    res = await fetch(FN + path.replace(/^\/api/, ''), {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { apikey: CFG.publishableKey, ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch { throw new Error('無法連線到伺服器，請確認網路後再試。'); }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) { session.clear(); throw new AuthError(); }
+  if (res.status === 403 && data.pending) throw new PendingError();
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
 
 function setView(html, { focus = false, tab = null } = {}) {
   clearInterval(timerHandle);
+  clearInterval(answerTimer);
+  Speech.stop(); // leaving a page stops any listening audio
   document.body.classList.toggle('focus', focus);
   $tabs.hidden = focus;
   for (const a of $tabs.querySelectorAll('a')) a.classList.toggle('on', a.dataset.tab === tab);
@@ -53,19 +135,30 @@ async function route() {
   const params = new URLSearchParams(query || '');
   const parts = path.split('/').filter(Boolean);
   try {
+    if (!session.get()) return loginView();
+    if (!ME || !ME.approved) {
+      ME = await api('/api/me');
+      if (!ME.authed) { session.clear(); return loginView(); }
+      if (!ME.approved) return pendingView();
+    }
+    if (ME.subject && SUBJECT !== ME.subject) setSubject(ME.subject);
+    if (parts[0] === 'choose' || !ME.subject) return chooseView();
     if (!META) META = await api('/api/meta');
+    if (parts[0] === 'settings') return await settingsView();
+    if (SUBJECT === 'gsat') return await gsatRoute(parts, params);
     if (parts[0] === 'practice') return await practice(parts[1], params);
-    if (parts[0] === 'attempt') return await attemptView(Number(parts[1]));
+    if (parts[0] === 'attempt') return await attemptView(Number(parts[1]), params);
+    if (parts[0] === 'writing') return await writingView(params);
     if (parts[0] === 'vocab' && parts[1] === 'screen') return await vocabScreen();
     if (parts[0] === 'vocab' && parts[1] === 'review') return await vocabQuizRun();
     if (parts[0] === 'vocab' && parts[1] === 'quiz') return await vocabQuizRun({ free: true, params });
     if (parts[0] === 'vocab' && parts[1] === 'known') return await vocabKnown();
     if (parts[0] === 'vocab') return await vocabHome(params);
     if (parts[0] === 'progress') return await progressView();
-    if (parts[0] === 'settings') return await settingsView();
     return await todayView();
   } catch (e) {
     if (e instanceof AuthError) return loginView();
+    if (e instanceof PendingError) { ME = null; return pendingView(); }
     errorView(e);
   }
 }
@@ -73,22 +166,58 @@ window.addEventListener('hashchange', route);
 window.route = route;
 
 // ---------- login ----------
-function loginView() {
-  setView(`<main class="stack" style="max-width:420px;padding-top:15vh">
+function loginView(mode = 'login', notice = '') {
+  const signup = mode === 'signup';
+  setView(`<main class="stack" style="max-width:420px;padding-top:12vh">
     <h1 style="font-size:2rem">TOEFL Coach</h1>
+    <p class="muted">${signup ? '建立帳號。註冊後需要等管理者核准才能使用。' : '用 Email 登入。'}</p>
+    ${notice ? `<p class="notice">${esc(notice)}</p>` : ''}
     <form id="login">
-      <label class="field"><span>密碼</span><input class="text" type="password" name="pw" autocomplete="current-password" required autofocus></label>
+      <label class="field"><span>Email</span><input class="text" type="email" name="email" autocomplete="email" required autofocus></label>
+      <label class="field"><span>密碼${signup ? '（至少 8 個字元）' : ''}</span>
+        <input class="text" type="password" name="pw" minlength="${signup ? 8 : 1}" autocomplete="${signup ? 'new-password' : 'current-password'}" required></label>
       <p class="error" id="err" hidden></p>
-      <button class="btn block" style="margin-top:16px">登入</button>
-    </form></main>`, { focus: true });
+      <button class="btn block" style="margin-top:16px">${signup ? '註冊' : '登入'}</button>
+    </form>
+    <button class="btn ghost block" id="switch">${signup ? '已經有帳號？登入' : '還沒有帳號？註冊'}</button>
+    </main>`, { focus: true });
+  document.getElementById('switch').onclick = () => loginView(signup ? 'login' : 'signup');
   document.getElementById('login').onsubmit = async ev => {
     ev.preventDefault();
     const err = document.getElementById('err');
+    const btn = ev.target.querySelector('button');
+    const email = ev.target.email.value.trim();
+    const password = ev.target.pw.value;
+    btn.disabled = true; err.hidden = true;
     try {
-      await api('/api/login', { password: ev.target.pw.value });
-      META = null; route();
-    } catch (e) { err.hidden = false; err.textContent = e.message; }
+      const data = signup
+        ? await authPost(`/signup?redirect_to=${encodeURIComponent(location.href.split('#')[0])}`, { email, password })
+        : await authPost('/token?grant_type=password', { email, password });
+      if (!data.access_token) return loginView('login', '已寄出確認信。請點信裡的連結確認 Email，再回來登入。');
+      session.set(data);
+      ME = null; META = null;
+      route();
+    } catch (e) { err.hidden = false; err.textContent = e.message; btn.disabled = false; }
   };
+}
+
+function pendingView() {
+  const email = ME?.email || session.get()?.email || '';
+  setView(`<main class="stack" style="max-width:420px;padding-top:12vh">
+    <h1 style="font-size:2rem">等待核准</h1>
+    <p>帳號 <b>${esc(email)}</b> 已建立，但還沒有被核准。核准之後就能開始練習。</p>
+    <button class="btn block" id="recheck">重新檢查</button>
+    <button class="btn ghost block" id="logout">登出</button></main>`, { focus: true });
+  document.getElementById('recheck').onclick = () => { ME = null; route(); };
+  document.getElementById('logout').onclick = logout;
+}
+
+async function logout() {
+  const s = session.get();
+  session.clear();
+  ME = null; // the next account must not inherit this one's subject or approval
+  if (s) authPost('/logout', {}, s.access_token).catch(() => {});
+  loginView();
 }
 
 // ---------- today ----------
@@ -96,7 +225,7 @@ function bandsRow(est, target) {
   const sec = est.sections;
   const cell = (k, v, cls = '') => `<div class="${cls}"><span class="v ${v == null ? 'none' : ''}">${fmtBand(v)}</span><span class="k">${k}</span></div>`;
   return `<div class="bands">
-    ${cell('閱讀', sec.reading?.band)}${cell('聽力', sec.listening?.band)}${cell('口說', sec.speaking?.band)}${cell('寫作', sec.writing?.band)}
+    ${cell('閱讀', sec.reading?.band)}${cell('聽力', sec.listening?.band)}${cell('口說*', sec.speaking?.band, 'typed')}${cell('寫作', sec.writing?.band)}
     ${cell('總分', est.overall, 'overall')}
   </div>`;
 }
@@ -136,13 +265,14 @@ async function todayView() {
       : `<p class="muted">${esc(plan.phase.zh)}・今天約 ${totalMin} 分鐘</p>`;
 
   setView(`<main>
+    ${(ME.subjects || []).length > 1 ? '<p class="subjbar"><a class="link small" href="#/choose">切換科目</a></p>' : ''}
     <div class="countdown"><span class="days">${Math.max(0, plan.daysLeft)}</span>
       <span class="unit"><b>天</b><span class="muted">到 ${exam.getMonth() + 1}/${exam.getDate()} 考試<br>目標總分 ${fmtBand(s.target)}</span></span></div>
     ${bandsRow(estimates, s.target)}
     <div class="stack">${intro}
       <div class="sheet">${vocabRows}${tasks}</div>
       ${allDone ? '<p>今天的任務都完成了。想多練可以到「進度」挑一個題型。</p>' : ''}
-      <p class="muted small">單字最多佔每天時間的一半，其餘給閱讀與寫作。聽力與口說（打字版）會在下一版加入。</p>
+      <p class="muted small">單字最多佔每天時間的一半，其餘依弱項分給閱讀、聽力、口說和寫作。＊口說是打字版，分數另外顯示，不算進總分。聽力和口說用瀏覽器內建語音播放，請開聲音。</p>
     </div></main>`, { tab: 'today' });
 }
 
@@ -163,7 +293,8 @@ async function nextInSession(session) {
   session.exclude.push(item.id);
   session.item = item;
   session.started = Date.now();
-  const render = { ctw: renderCtw, rdl: renderMc, acad: renderMc, bas: renderBas, email: renderWriting, disc: renderWriting }[type];
+  const render = { ctw: renderCtw, rdl: renderMc, acad: renderMc, lcr: renderListen, conv: renderListen, ann: renderListen, talk: renderListen,
+    rep: renderRep, interview: renderInterview, bas: renderBas, email: renderWriting, disc: renderWriting }[type];
   render(session);
   startTimer(session);
 }
@@ -320,7 +451,7 @@ function renderMc(session) {
 }
 
 function mcResultMarkup(c, detail) {
-  return detail.map((d, qi) => `<div class="q"><div class="stem">${qi + 1}. ${esc(d.q)}</div>
+  return detail.map((d, qi) => `<div class="q"><div class="stem">${d.q ? `${detail.length > 1 ? `${qi + 1}. ` : ''}${esc(d.q)}` : '選出最適合的回應。'}</div>
     ${d.options.map((o, oi) => {
       const cls = oi === d.answer ? 'correct' : (oi === d.picked ? 'missed' : '');
       return `<div class="opt ${cls}"><span class="letter">${LETTERS[oi]}</span><span>${esc(o)}</span></div>`;
@@ -347,7 +478,10 @@ function renderBas(session) {
     reply.innerHTML = template.map((t, i) => {
       if (!t.blank) return `<span class="given">${esc(t.t)}</span>`;
       const ci = filled.get(i);
-      return ci === undefined ? `<span class="slot" aria-label="空格"></span>` : `<button class="chip placed" data-slot="${i}">${esc(c.chunks[ci])}</button>`;
+      if (ci === undefined) return `<span class="slot" aria-label="空格"></span>`;
+      // the chip is lowercase; capitalize it only where it starts the sentence
+      const word = i === 0 ? c.chunks[ci].replace(/^(\s*)([a-z])/, (_, sp, ch) => sp + ch.toUpperCase()) : c.chunks[ci];
+      return `<button class="chip placed" data-slot="${i}">${esc(word)}</button>`;
     }).join(' ') + `<span class="given">${esc(c.end)}</span>`;
     const used = new Set(filled.values());
     document.querySelectorAll('#chips .chip').forEach(b => b.classList.toggle('used', used.has(Number(b.dataset.i))));
@@ -361,6 +495,355 @@ function renderBas(session) {
   });
   draw();
   submit.onclick = e => submitSession(session, { order: template.map((t, i) => (t.blank ? c.chunks[filled.get(i)] : t.t)) }, e.currentTarget);
+}
+
+// ---------- Speech: the browser's built-in text-to-speech ----------
+// Lines are split into sentences before speaking: Chrome stops long utterances after about 15 seconds.
+const Speech = {
+  voices: [],
+  loaded: null,
+  token: 0,
+  supported: typeof window !== 'undefined' && 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined',
+  load() {
+    if (this.loaded) return this.loaded;
+    this.loaded = new Promise(resolve => {
+      if (!this.supported) return resolve([]);
+      const got = () => {
+        const v = speechSynthesis.getVoices().filter(x => /^en[-_]/i.test(x.lang));
+        if (v.length) { this.voices = v; resolve(v); }
+      };
+      got();
+      speechSynthesis.addEventListener?.('voiceschanged', got);
+      setTimeout(() => resolve(this.voices), 2500); // some browsers never fire voiceschanged
+    });
+    return this.loaded;
+  },
+  // A female and a male US voice where the device has them; otherwise one voice at two pitches.
+  voiceFor(g) {
+    const us = this.voices.filter(v => /en[-_]US/i.test(v.lang));
+    const pool = us.length ? us : this.voices;
+    const female = /samantha|zira|aria|jenny|ava|allison|susan|karen|victoria|emma|michelle|salli|joanna|female|google us english/i;
+    const male = /alex|david|guy|daniel|fred|tom|aaron|christopher|eric|matthew|mark|andrew|brian|male/i;
+    const f = pool.find(v => female.test(v.name) && !/\bmale\b/i.test(v.name)) || pool[0];
+    const m = pool.find(v => male.test(v.name) && !female.test(v.name)) || this.voices.find(v => v !== f && /en[-_](GB|AU|CA)/i.test(v.lang));
+    if (g === 'm') return m ? { voice: m, pitch: 1 } : { voice: f, pitch: 0.75 };
+    return { voice: f, pitch: m ? 1 : 1.15 };
+  },
+  stop() {
+    this.token++;
+    try { if (this.supported) speechSynthesis.cancel(); } catch { /* not available */ }
+  },
+  // Plays script lines [{v, t}] in order. Resolves true when finished, false when stopped.
+  async play(lines, { rate = 1, onLine } = {}) {
+    await this.load();
+    this.stop();
+    const my = this.token;
+    if (!this.voices.length) return false;
+    for (let i = 0; i < lines.length; i++) {
+      if (my !== this.token) return false;
+      onLine?.(i);
+      const { voice, pitch } = this.voiceFor(lines[i].v);
+      for (const part of String(lines[i].t).split(/(?<=[.!?])\s+/).filter(Boolean)) {
+        if (my !== this.token) return false;
+        await new Promise(resolve => {
+          const u = new SpeechSynthesisUtterance(part);
+          try { u.voice = voice; } catch { /* keep the default voice */ }
+          u.lang = voice?.lang || 'en-US'; u.pitch = pitch; u.rate = 0.95 * rate;
+          u.onend = u.onerror = () => resolve();
+          speechSynthesis.speak(u);
+        });
+      }
+      if (i < lines.length - 1) await new Promise(r => setTimeout(r, 450)); // a short pause between speakers
+    }
+    return my === this.token;
+  },
+};
+
+const NO_VOICE_MSG = '這個瀏覽器沒有可用的英文語音，所以聽不到聲音。可以換 Chrome、Edge 或 Safari，或在系統設定加裝英文語音。也可以先看文字作答，這次會記錄成「沒有聲音」。';
+
+// A play / replay button with a speed choice. In the diagnostic (exam rules) it plays only once.
+// opts: { once, onStart, onEnd, label }
+function playerMarkup(id = 'player') {
+  return `<div class="player" id="${id}">
+    <button class="btn" data-act="play">▶ 播放</button>
+    <div class="speed" role="group" aria-label="播放速度"><button data-r="0.9">0.9×</button><button data-r="1" class="on">1.0×</button></div>
+    <span class="muted small pstate" aria-live="polite">還沒播放</span></div>`;
+}
+
+function wirePlayer(root, lines, { once = false, onStart, onEnd, label = '播放' } = {}) {
+  const btn = root.querySelector('[data-act="play"]');
+  const state = root.querySelector('.pstate');
+  let rate = 1; let plays = 0; let playing = false;
+  btn.textContent = `▶ ${label}`;
+  root.querySelectorAll('.speed button').forEach(b => b.onclick = () => {
+    rate = Number(b.dataset.r);
+    root.querySelectorAll('.speed button').forEach(x => x.classList.toggle('on', x === b));
+  });
+  const ctl = {
+    get plays() { return plays; },
+    async start() {
+      if (playing) { Speech.stop(); return; }
+      if (once && plays >= 1) return;
+      await Speech.load();
+      if (!Speech.voices.length) { state.textContent = NO_VOICE_MSG; onEnd?.({ noVoice: true }); return; }
+      plays++; playing = true;
+      onStart?.(plays);
+      btn.textContent = '■ 停止';
+      const ok = await Speech.play(lines, { rate, onLine: i => { state.textContent = lines.length > 1 ? `播放中…（${i + 1} / ${lines.length}）` : '播放中…'; } });
+      playing = false;
+      if (!root.isConnected) return;
+      if (once) { btn.disabled = true; btn.textContent = '已播放'; state.textContent = '正式考試只能聽一次。'; } else {
+        btn.textContent = '↻ 重聽'; state.textContent = plays > 1 ? `已聽 ${plays} 次` : '播完了，需要可以重聽（會記錄次數）';
+      }
+      onEnd?.({ finished: ok });
+    },
+  };
+  btn.onclick = () => ctl.start();
+  return ctl;
+}
+
+// ---------- Listening (choose a response / conversation / announcement / talk) ----------
+const LISTEN = ['lcr', 'conv', 'ann', 'talk'];
+
+function listenIntro(type, c) {
+  if (type === 'lcr') return '你會聽到一句話。聽完後選出最自然的回應。';
+  if (type === 'conv') {
+    const who = asList(c.speakers).map(s => `${esc(s.name)}${s.role ? `（${esc(s.role)}）` : ''}`).join('和');
+    return `你會聽到${who || '兩個人'}的對話。聽完後回答問題。`;
+  }
+  if (type === 'ann') return `你會聽到一段${c.role ? `${esc(c.role)}的` : ''}公告。聽完後回答問題。`;
+  return `你會聽到一段${c.course ? `${esc(c.course)}課的` : ''}講課。聽完後回答問題，可以邊聽邊做筆記。`;
+}
+
+function transcriptMarkup(c) {
+  const lines = asList(c.script);
+  return `<details class="transcript" open><summary>逐字稿</summary>
+    ${lines.map(l => `<p>${lines.length > 1 || l.s ? `<b>${esc(l.s || '')}</b> ` : ''}${esc(l.t)}</p>`).join('')}</details>`;
+}
+
+function renderListen(session) {
+  const c = session.item.content;
+  const once = session.mode === 'diagnostic';
+  const picks = new Array(c.questions.length).fill(null);
+  let noAudio = false;
+  const stem = (q, qi) => (q.q ? `${c.questions.length > 1 ? `${qi + 1}. ` : ''}${esc(q.q)}` : '選出最適合的回應。');
+  const qs = c.questions.map((q, qi) => `<div class="q"><div class="stem">${stem(q, qi)}</div>
+    ${q.options.map((o, oi) => `<button class="opt" data-q="${qi}" data-o="${oi}"><span class="letter">${LETTERS[oi]}</span><span>${esc(o)}</span></button>`).join('')}</div>`).join('');
+  setView(`${topBar(session)}<main>
+    <p class="muted small">${listenIntro(session.type, c)}${once ? '（診斷：跟正式考試一樣只能聽一次）' : ''}</p>
+    ${c.title && session.type !== 'lcr' ? `<p class="passage-title">${esc(c.title)}</p>` : ''}
+    ${playerMarkup()}
+    <p class="muted small" id="qhint">題目會在聽完之後出現。</p>
+    <div id="qs" hidden>${qs}</div>
+    <div id="noaudio"></div>
+    <button class="btn block" id="submit" style="margin-top:24px" disabled hidden>送出</button></main>`, { focus: true });
+  const submit = document.getElementById('submit');
+  const reveal = () => {
+    document.getElementById('qs').hidden = false; submit.hidden = false;
+    document.getElementById('qhint').hidden = true;
+  };
+  const player = wirePlayer(document.getElementById('player'), c.script, {
+    once,
+    onEnd: r => {
+      if (r.noVoice) {
+        document.getElementById('noaudio').innerHTML = `<button class="btn ghost block" id="showtext">看文字作答</button>`;
+        document.getElementById('showtext').onclick = () => {
+          noAudio = true;
+          document.getElementById('noaudio').innerHTML = `<div class="card passage">${c.script.map(l => `<p>${l.s ? `<b>${esc(l.s)}</b> ` : ''}${esc(l.t)}</p>`).join('')}</div>`;
+          reveal();
+        };
+        return;
+      }
+      reveal();
+    },
+  });
+  $app.querySelectorAll('#qs .opt').forEach(b => b.onclick = () => {
+    const qi = Number(b.dataset.q);
+    picks[qi] = Number(b.dataset.o);
+    $app.querySelectorAll(`.opt[data-q="${qi}"]`).forEach(x => x.classList.toggle('sel', x === b));
+    submit.disabled = picks.some(p => p === null);
+  });
+  submit.onclick = e => { Speech.stop(); submitSession(session, { answers: picks, plays: player.plays, noAudio }, e.currentTarget); };
+}
+
+function listenResult(content, feedback, response) {
+  const plays = response.plays || 0;
+  const note = response.noAudio ? '這次沒有聲音，是看文字作答的。' : plays > 1 ? `這次聽了 ${plays} 次（正式考試只能聽一次）。` : '';
+  return `${note ? `<p class="muted small">${note}</p>` : ''}
+    ${mcResultMarkup(content, feedback.detail)}
+    <div class="card" style="margin-top:16px">${playerMarkup('replay')}${transcriptMarkup(content)}</div>`;
+}
+
+// ---------- Speaking 1: Listen and Repeat (typed) ----------
+function renderRep(session) {
+  const c = session.item.content;
+  const once = session.mode === 'diagnostic';
+  const n = c.sentences.length;
+  const key = `draft:${session.item.id}`;
+  const answers = (() => { try { return JSON.parse(store.get(key) || '[]'); } catch { return []; } })();
+  const plays = new Array(n).fill(0);
+  let i = 0; let noAudio = false;
+  const step = () => {
+    setView(`${topBar(session)}<main>
+      <p class="muted small">${c.situation_zh ? `情境：${esc(c.situation_zh)}<br>` : ''}聽一句，把聽到的句子完整打出來。大小寫和標點不計分。${once ? '每句只能聽一次。' : ''}</p>
+      <div class="repstep"><b>第 ${i + 1} / ${n} 句</b><div class="dots">${c.sentences.map((_, k) => `<i class="${k < i ? 'on' : k === i ? 'cur' : ''}"></i>`).join('')}</div></div>
+      ${playerMarkup()}
+      <div id="noaudio"></div>
+      <textarea id="typed" class="short" rows="3" placeholder="聽完後在這裡打字" autocapitalize="sentences" autocomplete="off" autocorrect="off" spellcheck="false" disabled></textarea>
+      <button class="btn block" id="go" style="margin-top:16px" disabled>${i + 1 < n ? '下一句' : '送出'}</button>
+      <p class="muted small kbd-hint">Enter 到下一句</p></main>`, { focus: true });
+    startTimer(session);
+    const ta = document.getElementById('typed');
+    const go = document.getElementById('go');
+    ta.value = answers[i] || '';
+    const unlock = () => { ta.disabled = false; go.disabled = false; ta.focus(); };
+    const player = wirePlayer(document.getElementById('player'), [c.sentences[i]], {
+      once,
+      onStart: p => { plays[i] = p; },
+      onEnd: r => {
+        if (r.noVoice) {
+          noAudio = true;
+          document.getElementById('noaudio').innerHTML = `<div class="card passage">${esc(c.sentences[i].t)}</div><p class="muted small">沒有語音，先看文字練習打字。</p>`;
+        }
+        unlock();
+      },
+    });
+    if (i > 0) player.start(); // the click on 下一句 lets the browser play right away
+    ta.oninput = () => { answers[i] = ta.value; store.set(key, JSON.stringify(answers)); };
+    ta.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); go.click(); } };
+    go.onclick = e => {
+      answers[i] = ta.value;
+      if (i + 1 < n) { i++; step(); return; }
+      Speech.stop();
+      submitSession(session, { answers: c.sentences.map((_, k) => answers[k] || ''), plays, noAudio }, e.currentTarget);
+    };
+  };
+  step();
+}
+
+function repResult(content, feedback, response) {
+  const plays = asList(response.plays);
+  return `<div class="stack">${asList(feedback.detail).map((d, k) => `<div class="card rep">
+      <div class="row"><b class="spacer">第 ${k + 1} 句</b><span class="muted small">${plays[k] > 1 ? `聽了 ${plays[k]} 次・` : ''}</span><b>${d.points}<small>/5</small></b></div>
+      <p class="reptarget">${asList(d.marks).map(m => (m.ok ? esc(m.w) : `<mark class="miss">${esc(m.w)}</mark>`)).join(' ')}</p>
+      <p class="muted small">你打的：${d.given ? esc(d.given) : '（空白）'}</p>
+      <button class="link small" data-say="${k}">▶ 再聽一次</button></div>`).join('')}
+    <p class="muted small">標色的字是漏掉或打錯的。每句依正確字數比例給 0–5 分，整組取平均。</p></div>`;
+}
+
+// ---------- Speaking 2: Take an Interview (typed) ----------
+function renderInterview(session) {
+  const c = session.item.content;
+  const once = session.mode === 'diagnostic';
+  const n = c.questions.length;
+  const limit = session.meta.answerSeconds || 90;
+  const key = `draft:${session.item.id}`;
+  const answers = (() => { try { return JSON.parse(store.get(key) || '[]'); } catch { return []; } })();
+  const plays = new Array(n).fill(0);
+  const shown = new Array(n).fill(false);
+  let i = 0; let noAudio = false;
+
+  const intro = () => {
+    setView(`${topBar(session)}<main class="stack">
+      <h2>${esc(c.topic_zh || c.topic || '模擬面試')}</h2>
+      <p>面試官會用語音問 ${n} 個問題。每題聽完後有 <b>${limit} 秒</b>打字回答，時間到就會鎖住。</p>
+      <p class="muted small">正式考試是開口說 45 秒，打字比較慢，所以這裡給 ${limit} 秒，目標每題 60–80 字。題目只用聽的${once ? '，診斷時每題只能聽一次' : '，練習時可以重聽或看文字（會記錄）'}。</p>
+      <button class="btn block" id="begin">開始面試</button></main>`, { focus: true });
+    startTimer(session);
+    document.getElementById('begin').onclick = () => question();
+  };
+
+  const question = () => {
+    const lines = [...(i === 0 && c.intro ? [{ v: c.v, t: c.intro }] : []), { v: c.v, t: c.questions[i] }];
+    setView(`${topBar(session)}<main>
+      <div class="repstep"><b>第 ${i + 1} / ${n} 題</b><span class="answer-clock" id="clock">${fmtTime(limit)}</span></div>
+      ${playerMarkup()}
+      <div id="qtext"></div>
+      <textarea id="ans" placeholder="聽完問題後開始打字" autocapitalize="sentences" spellcheck="false" disabled></textarea>
+      <div class="row"><span class="muted small" id="wc">0 字</span><span class="spacer"></span>
+        ${once ? '' : '<button class="link small" id="showq">看題目文字</button>'}</div>
+      <button class="btn block" id="go" style="margin-top:12px" disabled>${i + 1 < n ? '下一題' : '送出批改'}</button></main>`, { focus: true });
+    startTimer(session);
+    const ta = document.getElementById('ans');
+    const go = document.getElementById('go');
+    const clock = document.getElementById('clock');
+    const wc = document.getElementById('wc');
+    ta.value = answers[i] || '';
+    let started = false;
+    const begin = () => {
+      if (started) return;
+      started = true; ta.disabled = false; go.disabled = false; ta.focus();
+      const t0 = Date.now();
+      clearInterval(answerTimer);
+      answerTimer = setInterval(() => {
+        const left = Math.max(0, limit - (Date.now() - t0) / 1000);
+        if (!clock.isConnected) return clearInterval(answerTimer);
+        clock.textContent = fmtTime(Math.ceil(left));
+        clock.classList.toggle('over', left <= 10);
+        if (left <= 0) {
+          clearInterval(answerTimer);
+          ta.readOnly = true; clock.textContent = '時間到';
+          go.focus();
+        }
+      }, 250);
+    };
+    const showText = () => {
+      document.getElementById('qtext').innerHTML = `<div class="card passage">${lines.map(l => esc(l.t)).join('<br>')}</div>`;
+    };
+    const player = wirePlayer(document.getElementById('player'), lines, {
+      once,
+      onStart: p => { plays[i] = p; },
+      onEnd: r => {
+        if (r.noVoice) { noAudio = true; shown[i] = true; showText(); }
+        begin();
+      },
+    });
+    const showq = document.getElementById('showq');
+    if (showq) showq.onclick = () => { shown[i] = true; showText(); showq.remove(); };
+    player.start(); // started by a click (開始 or 下一題), so the browser allows audio
+    ta.oninput = () => { answers[i] = ta.value; wc.textContent = `${words(ta.value)} 字`; store.set(key, JSON.stringify(answers)); };
+    wc.textContent = `${words(ta.value)} 字`;
+    go.onclick = e => {
+      answers[i] = ta.value;
+      clearInterval(answerTimer);
+      if (i + 1 < n) { i++; question(); return; }
+      Speech.stop();
+      submitSession(session, { answers: c.questions.map((_, k) => answers[k] || ''), plays, shownText: shown, noAudio }, e.currentTarget);
+    };
+  };
+  intro();
+}
+
+function interviewFeedback(fb, content, response) {
+  const list = (v, fn) => { const arr = asList(v); return arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>'; };
+  const answers = asList(response.answers);
+  const per = asList(fb.per_question);
+  const strengths = asList(fb.strengths_zh);
+  const upgrade = asList(fb.upgrade);
+  return `<div class="fb">
+    <p>${esc(fb.summary_zh)}</p>
+    <p class="muted small">打字版只評內容、組織和用字，不含發音與流暢度。</p>
+    ${content.questions.map((q, k) => `<div class="card iq">
+      <p class="small muted">第 ${k + 1} 題</p><p><b>${esc(q)}</b></p>
+      <p class="ianswer">${answers[k] ? esc(answers[k]) : '<span class="muted">（沒有作答）</span>'}</p>
+      <p class="muted small">${words(answers[k] || '')} 字</p>
+      ${per[k]?.comment_zh ? `<div class="explain small">${esc(per[k].comment_zh)}</div>` : ''}
+      ${per[k]?.better ? `<details><summary>更好的回答</summary><div class="passage" style="margin-top:6px">${esc(per[k].better)}</div></details>` : ''}
+    </div>`).join('')}
+    ${strengths.length ? `<h3>做得好的地方</h3><ul>${strengths.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+    <h3>修改</h3>${list(fb.corrections, c => `<li><del>${esc(c.original)}</del><ins>${esc(c.revised)}</ins><span class="why">${esc(c.why_zh)}</span></li>`)}
+    ${upgrade.length ? `<h3>可以換成更自然的說法</h3>${list(upgrade, u => `<li><del>${esc(u.original)}</del><ins>${esc(u.better)}</ins></li>`)}` : ''}
+    ${fb.next_focus_zh ? `<h3>下次練習的重點</h3><p>${esc(fb.next_focus_zh)}</p>` : ''}
+  </div>`;
+}
+
+// Wires the replay buttons on a listening / repeat result page.
+function wireResultAudio(type, content) {
+  const replay = document.getElementById('replay');
+  if (replay && content.script) wirePlayer(replay, content.script, { label: '再聽一次' });
+  if (type === 'rep') {
+    $app.querySelectorAll('[data-say]').forEach(b => b.onclick = () => Speech.play([content.sentences[Number(b.dataset.say)]]));
+  }
 }
 
 // ---------- Writing (email / academic discussion) ----------
@@ -395,31 +878,36 @@ function renderWriting(session) {
   };
 }
 
-function writingFeedback(fb, text) {
-  const list = (arr, fn) => (arr && arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>');
+function writingFeedback(fb, text, { openText = false } = {}) {
+  const list = (v, fn) => { const arr = asList(v); return arr.length ? `<ul class="fix-list">${arr.map(fn).join('')}</ul>` : '<p class="muted">—</p>'; };
+  const strengths = asList(fb.strengths_zh);
+  const upgrade = asList(fb.upgrade);
   return `<div class="fb">
     <p>${esc(fb.summary_zh)}</p>
     ${fb.task_zh ? `<h3>題目要求</h3><p>${esc(fb.task_zh)}</p>` : ''}
-    ${fb.strengths_zh?.length ? `<h3>做得好的地方</h3><ul>${fb.strengths_zh.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+    ${strengths.length ? `<h3>做得好的地方</h3><ul>${strengths.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
     <h3>修改</h3>${list(fb.corrections, c => `<li><del>${esc(c.original)}</del><ins>${esc(c.revised)}</ins><span class="why">${esc(c.why_zh)}</span></li>`)}
-    ${fb.upgrade?.length ? `<h3>可以換成更精準的說法</h3>${list(fb.upgrade, u => `<li><del>${esc(u.original)}</del><ins>${esc(u.better)}</ins></li>`)}` : ''}
+    ${upgrade.length ? `<h3>可以換成更精準的說法</h3>${list(upgrade, u => `<li><del>${esc(u.original)}</del><ins>${esc(u.better)}</ins></li>`)}` : ''}
     ${fb.next_focus_zh ? `<h3>下次練習的重點</h3><p>${esc(fb.next_focus_zh)}</p>` : ''}
     ${fb.model_answer ? `<details><summary>5 分範文（保留你的想法改寫）</summary><div class="card passage" style="margin-top:8px">${esc(fb.model_answer)}</div></details>` : ''}
-    ${text != null ? `<details><summary>你的原文</summary><div class="card passage" style="margin-top:8px">${esc(text)}</div></details>` : ''}
+    ${text != null ? `<details${openText ? ' open' : ''}><summary>你的原文（${words(text)} 字）</summary><div class="card passage" style="margin-top:8px">${esc(text)}</div></details>` : ''}
   </div>`;
 }
 
 // ---------- Results ----------
 function verdict(r) {
-  const ai = META.tasks[r.type].ai;
+  const ai = META.tasks[r.type].max5;
   const mark = ai ? `${fmtBand(r.raw)}<small>/5</small>` : `${r.raw}<small>/${r.max}</small>`;
   const note = ai ? `約等於 ${fmtBand(1 + r.raw)} 級` : `${Math.round(r.score * 100)}%`;
   return `<div class="verdict"><span class="mark">${mark}</span><span class="muted">${note}</span></div>`;
 }
 
-function resultBody(type, content, feedback, response, given) {
+function resultBody(type, content, feedback, response, given, opts) {
   if (type === 'ctw') return `<div class="card ctw">${ctwMarkup(content.tokens, { result: feedback.detail, given: given || response.blanks || [] })}</div>`;
   if (type === 'rdl' || type === 'acad') return mcPassage(content) + mcResultMarkup(content, feedback.detail);
+  if (LISTEN.includes(type)) return listenResult(content, feedback, response);
+  if (type === 'rep') return repResult(content, feedback, response);
+  if (type === 'interview') return interviewFeedback(feedback, content, response);
   if (type === 'bas') {
     const d = feedback.detail[0];
     return `<div class="speech"><b>${esc(content.speaker || 'A')}</b>${esc(content.context)}</div>
@@ -428,26 +916,91 @@ function resultBody(type, content, feedback, response, given) {
           : `<p><del style="color:var(--red)">${esc((response.order || []).join(' '))}</del></p><p><b>${esc(d.answer)}${esc(content.end)}</b></p>`}
         ${d.explain_zh ? `<div class="explain small">${esc(d.explain_zh)}</div>` : ''}</div>`;
   }
-  return writingFeedback(feedback, response.text);
+  return writingFeedback(feedback, response.text, opts);
 }
+
+// Types in the writing & speaking record (answers graded by Claude), with short names.
+const WRITING = ['email', 'disc', 'interview'];
+const WLABEL = { email: '信件', disc: '學術討論', interview: '面試' };
 
 function showResult(session, r, response) {
   setView(`${topBar(session)}<main>${verdict(r)}${ratingDelta(r)}
     ${resultBody(session.type, session.item.content, r.feedback, response, session.given)}
+    ${WRITING.includes(session.type) ? `<p style="margin-top:16px"><a class="link small" href="#/writing?type=${session.type}">看過去的${WLABEL[session.type]}紀錄</a></p>` : ''}
     ${afterResultButtons(session)}</main>`, { focus: true });
   document.getElementById('timer').textContent = '';
+  wireResultAudio(session.type, session.item.content);
   wireNext(session);
 }
 
-async function attemptView(id) {
+async function attemptView(id, params = new URLSearchParams()) {
   setView(loading(), { tab: 'progress' });
   const a = await api(`/api/attempt?id=${id}`);
   const r = { type: a.type, raw: a.raw_score, max: a.max_score, score: a.score };
-  setView(`<main><p><a class="link" href="#/progress">← 進度</a></p>
+  const writing = WRITING.includes(a.type);
+  const from = params.get('from');
+  const back = from === 'writing' ? `<a class="link" href="#/writing${params.get('t') ? `?type=${encodeURIComponent(params.get('t'))}` : ''}">← 寫作與口說紀錄</a>`
+    : '<a class="link" href="#/progress">← 進度</a>';
+  setView(`<main><p>${back}</p>
     <h2>${esc(META.tasks[a.type].zh)}</h2><p class="muted small">${esc(a.day)}・${fmtTime(a.seconds || 0)}</p>
-    ${a.type === 'email' || a.type === 'disc' ? writingPrompt(a.type, a.item.content) : ''}
-    ${verdict(r)}${resultBody(a.type, a.item.content, a.feedback, a.response)}
-    <a class="btn ghost block" style="margin-top:24px" href="#/practice/${a.type}?n=1">再練一題</a></main>`, { tab: 'progress' });
+    ${a.type === 'email' || a.type === 'disc' ? `<details class="prompt-wrap"><summary>題目</summary>${writingPrompt(a.type, a.item.content)}</details>` : ''}
+    ${a.type === 'rep' && a.item.content.situation_zh ? `<p class="muted small">情境：${esc(a.item.content.situation_zh)}</p>` : ''}
+    ${a.type === 'interview' ? `<p class="muted small">主題：${esc(a.item.content.topic_zh || a.item.content.topic)}</p>` : ''}
+    ${verdict(r)}${resultBody(a.type, a.item.content, a.feedback, a.response, undefined, { openText: true })}
+    <div class="row" style="margin-top:24px">
+      ${writing ? `<a class="btn ghost block" href="#/writing?type=${a.type}">全部紀錄</a>` : ''}
+      <a class="btn ghost block" href="#/practice/${a.type}?n=1">再練一題</a></div></main>`, { tab: 'progress' });
+  wireResultAudio(a.type, a.item.content);
+}
+
+// ---------- Writing & speaking record (email / academic discussion / interview) ----------
+function writingRow(w, filter) {
+  return `<a class="wcard" href="#/attempt/${w.id}?from=writing${filter ? `&t=${filter}` : ''}">
+    <div class="row"><span class="wtype">${WLABEL[w.type]}</span>
+      <span class="muted small spacer">${esc(w.day)}・${w.words} 字・${fmtTime(w.seconds || 0)}</span>
+      <b class="wscore">${fmtBand(w.score)}<small>/5</small></b></div>
+    <p class="wprompt">${w.meta ? `<span class="muted">${esc(w.meta)}｜</span>` : ''}${esc(w.prompt)}</p>
+    ${w.answer ? `<p class="wanswer">${esc(w.answer)}</p>` : '<p class="wanswer muted">（沒有作答內容）</p>'}
+    ${w.summary ? `<p class="wsummary">${esc(w.summary)}</p>` : ''}
+  </a>`;
+}
+
+async function writingView(params) {
+  const filter = WRITING.includes(params.get('type')) ? params.get('type') : '';
+  setView(loading(), { tab: 'progress' });
+  const d = await api(`/api/writing${filter ? `?type=${filter}` : ''}`);
+  const stat = t => {
+    const s = d.stats[t];
+    return `<div><b>${s.n ? fmtBand(s.recentAvg) : '—'}</b><span>${WLABEL[t]}・近 5 次平均</span>
+      <span class="muted small">${s.n ? `共 ${s.n} ${t === 'interview' ? '次' : '篇'}・最高 ${fmtBand(s.best)}` : '還沒做過'}</span></div>`;
+  };
+  const shown = filter ? [filter] : WRITING;
+  const trends = shown.filter(t => d.stats[t].trend.length > 1)
+    .map(t => `<p class="muted small" style="margin-bottom:4px">${WLABEL[t]}分數走勢（換算成 1–6 級分）</p>
+      ${sparkline(d.stats[t].trend.map(s => 1 + s), d.target, `${WLABEL[t]}分數走勢`)}`).join('');
+  const seg = [['', '全部'], ...WRITING.map(t => [t, WLABEL[t]])]
+    .map(([t, label]) => `<a href="#/writing${t ? `?type=${t}` : ''}" class="${t === filter ? 'on' : ''}"${t === filter ? ' aria-current="page"' : ''}>${esc(label)}</a>`).join('');
+  setView(`<main class="stack">
+    <p><a class="link" href="#/progress">← 進度</a></p>
+    <h2>寫作與口說紀錄</h2>
+    <div class="wstats">${WRITING.map(stat).join('')}</div>
+    ${trends}
+    <nav class="seg" aria-label="篩選題型">${seg}</nav>
+    <div id="wlist">${d.items.map(w => writingRow(w, filter)).join('') || '<p class="muted">還沒有紀錄。完成一次並送出批改後會出現在這裡。</p>'}</div>
+    ${d.more ? '<button class="btn ghost block" id="wmore">載入更多</button>' : ''}
+    <div class="btn-grid">${shown.map(t => `<a class="btn block" href="#/practice/${t}?n=1">練習${WLABEL[t]}</a>`).join('')}</div>
+  </main>`, { tab: 'progress' });
+  let next = d.next;
+  const more = document.getElementById('wmore');
+  if (more) more.onclick = async () => {
+    more.disabled = true; more.textContent = '載入中…';
+    try {
+      const p = await api(`/api/writing?before=${next}${filter ? `&type=${filter}` : ''}`);
+      document.getElementById('wlist').insertAdjacentHTML('beforeend', p.items.map(w => writingRow(w, filter)).join(''));
+      next = p.next;
+      if (p.more) { more.disabled = false; more.textContent = '載入更多'; } else more.remove();
+    } catch (e) { more.disabled = false; more.textContent = `載入失敗，再試一次（${e.message}）`; }
+  };
 }
 
 // ---------- Vocabulary ----------
@@ -476,8 +1029,8 @@ function cardBack(w) {
   return `<div class="vback">
     <p class="vzh"><span class="pos">${esc(c.pos || '')}</span>${esc(c.zh || '')}</p>
     ${c.example ? `<p class="vex">${ex}</p><p class="muted small">${esc(c.example_zh || '')}</p>` : ''}
-    ${c.collocations?.length ? `<p class="small"><b>常見搭配</b>　${c.collocations.map(esc).join('、')}</p>` : ''}
-    ${c.family?.length ? `<p class="small"><b>詞性變化</b>　${c.family.map(f => `${esc(f.w)} <span class="muted">${esc(f.pos)}</span>`).join('、')}</p>` : ''}
+    ${asList(c.collocations).length ? `<p class="small"><b>常見搭配</b>　${asList(c.collocations).map(x => esc(x)).join('、')}</p>` : ''}
+    ${asList(c.family).length ? `<p class="small"><b>詞性變化</b>　${asList(c.family).map(f => (f && typeof f === 'object' ? `${esc(f.w)} <span class="muted">${esc(f.pos)}</span>` : esc(f))).join('、')}</p>` : ''}
     ${c.tip_zh ? `<p class="small explain">${esc(c.tip_zh)}</p>` : ''}
   </div>`;
 }
@@ -629,6 +1182,12 @@ async function vocabQuizRun({ free = false, params = new URLSearchParams() } = {
     if (i >= data.items.length) {
       if (free) return finish();
       data = await api(url); i = 0;
+      if (!data.items.length && data.waitingForCards && data.cardError) {
+        return setView(`${vocabTop(title, prog())}<main class="stack" style="padding-top:8vh">
+          <h2>單字卡還沒準備好</h2><p class="error">${esc(data.cardError)}</p>
+          <p class="muted">${data.waitingForCards} 個字在等單字卡。過幾分鐘會自動重試。</p>
+          <button class="btn block" onclick="route()">重試</button><a class="btn ghost block" href="#/">回到今天</a></main>`, { focus: true });
+      }
       if (!data.items.length && data.waitingForCards) {
         setView(`${vocabTop(title, prog())}${loading(`題目準備中（${data.waitingForCards} 個）`)}`, { focus: true });
         setTimeout(() => next().catch(errorView), 3000);
@@ -708,7 +1267,7 @@ async function vocabQuizRun({ free = false, params = new URLSearchParams() } = {
     document.getElementById('check').onclick = () => {
       const given = (read()[0] || '').replace(/\s/g, '').toLowerCase();
       const target = w.word.toLowerCase();
-      const near = [...(c.quiz?.synonyms || []), ...(c.family || []).map(f => String(f.w).toLowerCase())];
+      const near = [...asList(c.quiz?.synonyms), ...asList(c.family).map(f => String(f?.w ?? f).toLowerCase())];
       let result; let msg;
       if (given === target) { result = hinted ? 'hard' : 'good'; msg = hinted ? '拼對了（用了提示）' : '拼對了'; }
       else if (given && near.includes(given)) { result = 'hard'; msg = `「${given}」很接近，但這裡要的是 ${w.word}`; }
@@ -742,13 +1301,13 @@ async function vocabQuizRun({ free = false, params = new URLSearchParams() } = {
 }
 
 // ---------- Progress ----------
-function sparkline(points, target) {
+function sparkline(points, target, label = '整體能力估計趨勢') {
   if (points.length < 2) return '';
   const W = 640, H = 140, P = 8;
   const x = i => P + (i / (points.length - 1)) * (W - 2 * P);
   const y = v => H - P - ((v - 1) / 5) * (H - 2 * P);
   const d = points.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="整體能力估計趨勢">
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">
     <line x1="${P}" x2="${W - P}" y1="${y(target)}" y2="${y(target)}" stroke="var(--red)" stroke-dasharray="4 4"/>
     <text x="${W - P}" y="${y(target) - 6}" text-anchor="end" fill="var(--red)" font-size="14">目標 ${fmtBand(target)}</text>
     <path d="${d}" fill="none" stroke="var(--ink)" stroke-width="2.5" stroke-linejoin="round"/></svg>`;
@@ -758,39 +1317,463 @@ async function progressView() {
   setView(loading(), { tab: 'progress' });
   const d = await api('/api/dashboard');
   const target = d.settings.target;
-  const rows = Object.entries(META.tasks).map(([type, m]) => {
+  const sections = Object.entries(META.sections);
+  const skillRow = type => {
+    const m = META.tasks[type];
     const s = d.estimates.skills[type];
     const pct = s.n ? ((s.rating - 1) / 5) * 100 : 0;
     return `<a class="skill-row" href="#/practice/${type}?n=${m.sessionSize}">
       <div><div><b>${esc(m.zh)}</b></div><div class="muted small">${s.n ? `練過 ${s.n} 次` : '還沒練過'}</div></div>
       <div class="meter"><span style="width:${pct}%"></span><i class="target" style="left:${((target - 1) / 5) * 100}%"></i></div>
       <b>${s.n ? fmtBand(s.rating) : '—'}</b></a>`;
-  }).join('');
+  };
+  const rows = sections.map(([, sec]) => `<h3 class="sec">${esc(sec.zh)}${sec.typed ? '<span class="muted small">（打字版，不算進總分）</span>' : ''}</h3>
+    ${sec.types.map(skillRow).join('')}`).join('');
 
-  // overall trend: replay history, average of latest rating per type that has data
+  // overall trend: replay history, average of latest rating per type that has data (typed speaking left out)
+  const typedTypes = new Set(sections.filter(([, sec]) => sec.typed).flatMap(([, sec]) => sec.types));
   const latest = {}; const trend = [];
-  for (const h of d.history) { latest[h.type] = h.rating; const v = Object.values(latest); trend.push(v.reduce((a, b) => a + b, 0) / v.length); }
+  for (const h of d.history) {
+    if (typedTypes.has(h.type)) continue;
+    latest[h.type] = h.rating; const v = Object.values(latest); trend.push(v.reduce((a, b) => a + b, 0) / v.length);
+  }
 
-  const hist = d.recent.map(a => `<li><a href="#/attempt/${a.id}"><span class="spacer">${esc(META.tasks[a.type].zh)}</span>
-    <span class="muted small">${esc(a.day.slice(5))}</span><b>${META.tasks[a.type].ai ? fmtBand(a.raw_score) + '/5' : `${a.raw_score}/${a.max_score}`}</b></a></li>`).join('');
+  // past practice, grouped by section and task type; each group loads its list when opened
+  const group = type => {
+    const m = META.tasks[type];
+    const c = d.byType?.[type];
+    return `<details class="tgroup" data-type="${type}"><summary><b class="spacer">${esc(m.zh)}</b>
+        <span class="muted small">${c ? `${c.n} 次・最近 ${esc(String(c.last).slice(5))}` : '還沒練過'}</span></summary>
+      <div class="tlist">${c ? '<p class="muted small">載入中…</p>' : '<p class="muted small">還沒有紀錄。</p>'}</div></details>`;
+  };
+  const groups = sections.map(([, sec]) => `<h3 class="sec">${esc(sec.zh)}</h3>${sec.types.map(group).join('')}`).join('');
 
   setView(`<main class="stack">
     <h2>各題型能力</h2>
     <p class="muted small">1–6 級分估計，紅線是目標 ${fmtBand(target)}。點題型可以額外練習。</p>
     <div>${rows}</div>
     ${trend.length > 1 ? `<h2>整體趨勢</h2>${sparkline(trend.slice(-60), target)}` : ''}
-    <h2>最近的練習</h2>
-    ${hist ? `<ul class="hist">${hist}</ul>` : '<p class="muted">還沒有練習紀錄。從「今天」的診斷開始。</p>'}
+    <div class="sheet"><a class="task" href="#/writing"><div class="spacer"><div class="name">寫作與口說紀錄</div>
+      <div class="sub">信件、學術討論和模擬面試的作答、分數和批改</div></div><span class="muted">›</span></a></div>
+    <h2>過去的練習</h2>
+    <p class="muted small">依題型分類，點開看每一次的結果。</p>
+    <div>${groups}</div>
+  </main>`, { tab: 'progress' });
+
+  $app.querySelectorAll('.tgroup').forEach(det => det.addEventListener('toggle', () => {
+    if (det.open && !det.dataset.loaded && d.byType?.[det.dataset.type]) loadTypeHistory(det);
+  }));
+}
+
+function historyRow(a) {
+  const m = META.tasks[a.type];
+  const mark = m.max5 ? `${fmtBand(a.raw_score)}<small>/5</small>` : `${a.raw_score}<small>/${a.max_score}</small>`;
+  return `<li><a href="#/attempt/${a.id}"><span class="spacer">${esc(a.day)}${a.mode === 'diagnostic' ? '<span class="tag plain">診斷</span>' : ''}</span>
+    <span class="muted small">${fmtTime(a.seconds || 0)}</span><b>${mark}</b></a></li>`;
+}
+
+async function loadTypeHistory(det, before = null) {
+  det.dataset.loaded = '1';
+  const box = det.querySelector('.tlist');
+  try {
+    const p = await api(`/api/history?type=${det.dataset.type}${before ? `&before=${before}` : ''}`);
+    const list = `<ul class="hist">${p.items.map(historyRow).join('')}</ul>`;
+    if (before) { box.querySelector('.tmore')?.remove(); box.insertAdjacentHTML('beforeend', list); } else box.innerHTML = list;
+    if (WRITING.includes(det.dataset.type) && !before) {
+      box.insertAdjacentHTML('afterbegin', `<p class="small"><a class="link" href="#/writing?type=${det.dataset.type}">在寫作與口說紀錄裡看作答內容 ›</a></p>`);
+    }
+    if (p.more) {
+      box.insertAdjacentHTML('beforeend', '<button class="link small tmore">載入更多</button>');
+      box.querySelector('.tmore').onclick = () => loadTypeHistory(det, p.next);
+    }
+  } catch (e) {
+    det.dataset.loaded = '';
+    box.innerHTML = `<p class="error small">${esc(e.message)}</p>`;
+  }
+}
+
+// ---------- Choose a subject ----------
+async function chooseView() {
+  const params = new URLSearchParams(location.hash.split('?')[1] || '');
+  const subjects = ME.subjects || [];
+  const pick = async k => {
+    const r = await api('/api/subject', { subject: k });
+    ME.subject = r.subject;
+    setSubject(r.subject);
+    location.hash = '#/';
+    if (location.hash === '#/') route(); // same hash: hashchange does not fire
+  };
+  const to = params.get('to');
+  if (to && subjects.includes(to)) return pick(to); // from the switch in 設定
+  if (subjects.length === 1) return pick(subjects[0]);
+  setView(`<main class="stack">
+    <h2>你今天要練什麼？</h2>
+    <p class="muted small">之後可以在「設定」切換。兩個科目共用每天的 AI 次數。</p>
+    <div class="choose">${subjects.map(k => `<button class="choice" data-k="${k}"><b>${esc(SUBJECT_INFO[k].name)}</b><span>${esc(SUBJECT_INFO[k].desc)}</span></button>`).join('')}</div>
+    <button class="btn ghost block" id="logout">登出</button></main>`, { focus: true });
+  $app.querySelectorAll('.choice').forEach(b => b.onclick = () => { b.disabled = true; pick(b.dataset.k).catch(errorView); });
+  document.getElementById('logout').onclick = logout;
+}
+
+// ---------- 學測翻譯 ----------
+const GSAT_ERR = { spelling: '拼字', grammar: '文法', word: '用字', omission: '漏譯', capital: '大寫', punct: '標點' };
+const fmtPts = v => (v == null ? '—' : Number.isInteger(Number(v)) ? String(Number(v)) : Number(v).toFixed(1));
+
+async function gsatRoute(parts, params) {
+  const p = parts[0] === 'gsat' ? parts.slice(1) : [];
+  if (p[0] === 'practice') return gsatPractice(params);
+  if (p[0] === 'result') return gsatResult(Number(p[1]));
+  if (p[0] === 'bank') return gsatBank();
+  if (p[0] === 'phrases' && p[1] === 'review') return gsatPhraseReview();
+  if (p[0] === 'phrases') return gsatPhrases();
+  if (p[0] === 'progress') return gsatProgress();
+  return gsatToday();
+}
+
+async function gsatToday() {
+  setView(loading(), { tab: 'today' });
+  const [t, pr] = await Promise.all([api('/api/gsat/today'), api('/api/gsat/progress')]);
+  const left = Math.max(0, t.target - t.done);
+  const bubbles = Array.from({ length: t.target }, (_, k) => `<i class="${k < t.done ? 'on' : ''}"></i>`).join('');
+  const switcher = (ME.subjects || []).length > 1 ? '<a class="link small" href="#/choose">切換科目</a>' : '';
+  setView(`<main>
+    <div class="row"><h2 class="spacer">學測翻譯</h2>${switcher}</div>
+    <div class="wstats g3">
+      <div><b>${pr.recentAvg == null ? '—' : fmtPts(Math.round(pr.recentAvg * 10) / 10)}</b><span>近 10 組平均（滿分 8）</span></div>
+      <div><b>${pr.past.done}<small>/${pr.past.total}</small></b><span>考古題完成</span></div>
+      <div><b>${pr.n}</b><span>累計練習組數</span></div></div>
+    <div class="stack">
+      <div class="sheet">
+        <a class="task ${left ? 'next' : 'complete'}" href="#/gsat/practice"><div class="spacer"><div class="name">今天的翻譯</div>
+          <div class="sub">${t.reviewDue ? `先複習 ${t.reviewDue} 組沒拿到 7 分的題目，再做新題` : '從考古題開始，做完再出新題'}${t.settings.timerMinutes ? `・每組 ${t.settings.timerMinutes} 分鐘` : ''}</div></div>
+          <div class="bubbles" aria-label="完成 ${t.done} / ${t.target}">${bubbles}</div></a>
+        <a class="task ${t.phrasesDue ? '' : 'complete'}" href="#/gsat/phrases/review"><div class="spacer"><div class="name">片語複習</div>
+          <div class="sub">${t.phrasesDue ? `${t.phrasesDue} 個到期` : '今天沒有到期的片語'}</div></div><div class="count">${t.phrasesDue}</div></a>
+        <a class="task" href="#/gsat/practice?kind=ai"><div class="spacer"><div class="name">AI 新題</div><div class="sub">依你常錯的地方出題</div></div><span class="muted">›</span></a>
+        <a class="task" href="#/gsat/bank"><div class="spacer"><div class="name">考古題</div><div class="sub">93–114 年，自己挑年份</div></div><span class="muted">›</span></a>
+      </div>
+      ${left ? '' : '<p>今天的份量完成了。想多練可以做 AI 新題，或到題庫挑考古題。</p>'}
+      <details class="rules"><summary>評分方式（大考中心原則）</summary>
+        <ul class="small"><li>每句 4 分，依意思分成前後 2 個部分，各 2 分，兩部分分開計分。</li>
+        <li>每個錯誤扣 0.5 分，扣到該部分 0 分為止；整個部分沒翻或完全譯錯，該部分 0 分。</li>
+        <li>相同的拼字或文法錯誤只扣一次。</li>
+        <li>句首沒大寫、標點不妥，各扣 0.5 分，只扣一次。</li>
+        <li>分數由程式依錯誤清單照上面規則計算，每 0.5 分都看得到原因。</li></ul></details>
+    </div></main>`, { tab: 'today' });
+}
+
+function gsatTimer(started, minutes) {
+  const tick = () => {
+    const el = document.getElementById('timer');
+    if (!el) return clearInterval(timerHandle);
+    const s = (Date.now() - started) / 1000;
+    if (minutes) { const left = minutes * 60 - s; el.textContent = (left < 0 ? '+' : '') + fmtTime(Math.abs(left)); el.classList.toggle('over', left < 0); }
+    else el.textContent = fmtTime(s);
+  };
+  tick(); timerHandle = setInterval(tick, 1000);
+}
+
+async function gsatPractice(params) {
+  setView(loading('準備題目'), { focus: true });
+  const rewrite = Number(params.get('rewrite')) || null;
+  const q = new URLSearchParams();
+  if (params.get('id')) q.set('id', params.get('id'));
+  if (params.get('kind')) q.set('kind', params.get('kind'));
+  const [set, settings, prev] = await Promise.all([api(`/api/gsat/next?${q}`), api('/api/gsat/settings'),
+    rewrite ? api(`/api/gsat/attempt?id=${rewrite}`) : null]);
+  const key = `gsat:draft:${set.id}${rewrite ? `:r${rewrite}` : ''}`;
+  let draft = [];
+  try { draft = JSON.parse(store.get(key) || '[]'); } catch { /* ignore */ }
+  const hints = set.sentences.map(() => false);
+  const started = Date.now();
+  setView(`<div class="ptop"><a class="link" href="#/" aria-label="離開">✕</a>
+      <span class="title">${esc(set.label || '學測翻譯')}</span><span class="spacer"></span><span class="timer" id="timer"></span></div>
+    <main class="stack">
+      ${rewrite ? '<p class="notice small">重寫：照剛才的回饋修改，再交一次看看分數。</p>' : `<p class="muted small">把下面兩句中文翻成英文。每句 4 分。${set.topic_zh ? `主題：${esc(set.topic_zh)}` : ''}</p>`}
+      ${set.sentences.map((s, i) => `<div class="gq">
+        <p class="gzh"><span class="gnum">${i + 1}</span>${esc(s.zh)}</p>
+        <textarea class="gans" data-i="${i}" rows="3" placeholder="在這裡寫英文" autocapitalize="sentences" autocomplete="off" spellcheck="false"></textarea>
+        <div class="row"><span class="muted small wc" data-i="${i}">0 字</span><span class="spacer"></span>
+          ${s.hints.length ? `<button class="link small hintbtn" data-i="${i}">提示</button>` : ''}</div>
+        <div class="ghint" data-i="${i}" hidden>${s.hints.map(h => `<span class="chip-s"><b>${esc(h.en)}</b> ${esc(h.zh)}</span>`).join('')}</div>
+      </div>`).join('')}
+      <button class="btn block" id="submit">送出批改</button>
+      <p class="muted small">拼字檢查已關閉，跟考場一樣。批改大約 20 秒，算 1 次 AI。</p></main>`, { focus: true });
+  gsatTimer(started, settings.timerMinutes);
+  const tas = [...$app.querySelectorAll('.gans')];
+  tas.forEach((ta, i) => {
+    ta.value = draft[i] ?? (prev ? prev.answers[i] || '' : '');
+    const wc = $app.querySelector(`.wc[data-i="${i}"]`);
+    const upd = () => { wc.textContent = `${words(ta.value)} 字`; store.set(key, JSON.stringify(tas.map(x => x.value))); };
+    ta.oninput = upd; upd();
+  });
+  tas[0]?.focus();
+  $app.querySelectorAll('.hintbtn').forEach(b => b.onclick = () => {
+    const i = Number(b.dataset.i);
+    hints[i] = true;
+    $app.querySelector(`.ghint[data-i="${i}"]`).hidden = false;
+    b.remove();
+  });
+  const submit = document.getElementById('submit');
+  submit.onclick = async () => {
+    const answers = tas.map(t => t.value);
+    if (answers.every(a => !a.trim()) && !confirm('兩句都沒寫，確定要送出嗎？')) return;
+    submit.disabled = true; submit.textContent = '批改中，約 20 秒…';
+    clearInterval(timerHandle);
+    try {
+      const r = await api('/api/gsat/submit', { itemId: set.id, answers, hints, seconds: (Date.now() - started) / 1000, rewriteOf: rewrite });
+      store.del(key);
+      location.hash = `#/gsat/result/${r.id}`;
+    } catch (e) {
+      submit.disabled = false; submit.textContent = '重新送出';
+      gsatTimer(started, settings.timerMinutes);
+      alert(`送出失敗：${e.message}\n你的作答還在畫面上，可以再試一次。`);
+    }
+  };
+}
+
+// The learner's answer with each error's words underlined and numbered.
+function markErrors(answer, errors) {
+  const text = String(answer || '');
+  const spans = [];
+  errors.forEach((e, k) => {
+    if (!e.original) return;
+    let from = 0; let at = -1;
+    while ((at = text.indexOf(e.original, from)) !== -1 && spans.some(s => at < s.end && at + e.original.length > s.start)) from = at + 1;
+    if (at === -1) { // try ignoring case
+      const lower = text.toLowerCase(); from = 0;
+      while ((at = lower.indexOf(e.original.toLowerCase(), from)) !== -1 && spans.some(s => at < s.end && at + e.original.length > s.start)) from = at + 1;
+    }
+    if (at !== -1) spans.push({ start: at, end: at + e.original.length, k });
+  });
+  spans.sort((x, y) => x.start - y.start);
+  let out = ''; let pos = 0;
+  for (const sp of spans) {
+    out += esc(text.slice(pos, sp.start)) + `<mark class="gerr">${esc(text.slice(sp.start, sp.end))}<sup>${sp.k + 1}</sup></mark>`;
+    pos = sp.end;
+  }
+  return out + esc(text.slice(pos));
+}
+
+function costLabel(e) {
+  if (e.type === 'omission') return e.cost ? `該部分 0 分` : '—';
+  if (e.cost) return `−${fmtPts(e.cost)}`;
+  if (e.type === 'capital' || e.type === 'punct') return '只扣一次';
+  return e.type === 'spelling' || e.type === 'grammar' ? '重複，不再扣' : '已扣到 0';
+}
+
+async function gsatResult(id) {
+  setView(loading(), { tab: 'today' });
+  const a = await api(`/api/gsat/attempt?id=${id}`);
+  const fb = a.feedback;
+  const prev = a.rewriteOf ? await api(`/api/gsat/attempt?id=${a.rewriteOf}`).catch(() => null) : null;
+  const sentenceBlock = (zh, i) => {
+    const s = fb.sentences[i] || { errors: [], parts: [0, 0], points: 0 };
+    const parts = fb.parts?.[i] || [];
+    return `<section class="gres">
+      <div class="row"><h3 class="spacer"><span class="gnum">${i + 1}</span>${esc(zh)}</h3><b class="gpts">${fmtPts(s.points)}<small>/4</small></b></div>
+      <div class="gparts">${[0, 1].map(p => `<span>${esc(parts[p] || `第 ${p + 1} 部分`)}<b>${fmtPts(s.parts?.[p] ?? 0)}/2</b></span>`).join('')}</div>
+      <p class="small muted" style="margin-bottom:2px">你的翻譯${a.hints[i] ? '（用了提示）' : ''}</p>
+      <div class="card gyour">${a.answers[i] ? markErrors(a.answers[i], s.errors) : '<span class="muted">（沒有作答）</span>'}</div>
+      ${s.errors.length ? `<ol class="gerrs">${s.errors.map(e => `<li>
+          <span class="etag t-${e.type}">${GSAT_ERR[e.type] || e.type}</span><span class="ecost">${costLabel(e)}</span>
+          <div>${e.original ? `<del>${esc(e.original)}</del> → ` : ''}<ins>${esc(e.fix)}</ins></div>
+          <div class="why">${esc(e.why_zh)}</div></li>`).join('')}</ol>`
+        : (a.answers[i] ? '<p class="right small">這句沒有扣分的錯誤。</p>' : '')}
+      ${s.comment_zh ? `<p class="explain small">${esc(s.comment_zh)}</p>` : ''}
+      ${s.minimal_fix && s.errors.length ? `<p class="small muted" style="margin-bottom:2px">最小修改（保留你的寫法）</p><div class="card gfix">${esc(s.minimal_fix)}</div>` : ''}
+      ${s.better?.length ? `<p class="small muted" style="margin-bottom:2px">更道地的寫法</p>${s.better.map(b => `<div class="card gbetter"><div>${esc(b.en)}</div>${b.note_zh ? `<div class="why">${esc(b.note_zh)}</div>` : ''}</div>`).join('')}` : ''}
+      ${fb.refs?.[i]?.length ? `<details class="small"><summary>參考譯法</summary>${fb.refs[i].map(r => `<p>${esc(r)}</p>`).join('')}</details>` : ''}
+    </section>`;
+  };
+  const phrases = (fb.phrases || []).map((p, k) => `<div class="card gphrase">
+      <div class="row"><b class="spacer">${esc(p.phrase)}</b>${p.used ? '<span class="tag ok">你用對了</span>' : ''}
+        <button class="btn ghost small addp" data-k="${k}" ${p.saved ? 'disabled' : ''}>${p.saved ? '已在片語本' : '＋ 片語本'}</button></div>
+      <div>${esc(p.zh)}</div>
+      ${p.example ? `<div class="gex">${esc(p.example)}</div><div class="muted small">${esc(p.example_zh)}</div>` : ''}
+      ${p.note_zh ? `<div class="why">${esc(p.note_zh)}</div>` : ''}</div>`).join('');
+  const chat = c => c.map(x => `<div class="qa"><p class="q">你：${esc(x.q)}</p><p class="a">${esc(x.a)}</p></div>`).join('');
+  setView(`<main class="stack">
+    <p><a class="link" href="#/">← 今天</a></p>
+    <div class="row"><h2 class="spacer">${esc(a.set.label || '學測翻譯')}</h2><span class="muted small">${esc(a.day)}・${fmtTime(a.seconds || 0)}</span></div>
+    <div class="verdict"><span class="mark">${fmtPts(a.score)}<small>/8</small></span>
+      <span class="muted">${prev ? `重寫：${fmtPts(prev.score)} → <b>${fmtPts(a.score)}</b>` : a.score >= 7 ? '很好，接近滿分' : a.score >= 5 ? '有基本分，還有進步空間' : '這組值得重寫一次'}</span></div>
+    ${fb.summary_zh ? `<p>${esc(fb.summary_zh)}</p>` : ''}
+    ${a.set.sentences.map(sentenceBlock).join('')}
+    ${phrases ? `<h3>這組值得記的片語與句型</h3>${phrases}` : ''}
+    ${fb.pitfalls_zh?.length ? `<h3>常見陷阱</h3><ul>${fb.pitfalls_zh.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+    ${fb.next_step_zh ? `<h3>下次的重點</h3><p>${esc(fb.next_step_zh)}</p>` : ''}
+    <h3>問家教</h3>
+    <p class="muted small">對這組批改有疑問可以直接問，例如「這裡可以用 which 嗎？」。每問一次算 1 次 AI，每組最多 8 題。</p>
+    <div id="chat">${chat(fb.chat || [])}</div>
+    <form id="ask" class="askrow"><input class="text" name="q" maxlength="500" placeholder="輸入你的問題" autocomplete="off"><button class="btn">問</button></form>
+    <div class="btn-grid" style="margin-top:8px">
+      <a class="btn ghost block" href="#/gsat/practice?id=${a.itemId}&rewrite=${a.id}">重寫一次</a>
+      <a class="btn block" href="#/gsat/practice">下一組</a></div>
+  </main>`, { tab: 'today' });
+  $app.querySelectorAll('.addp').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try { await api('/api/gsat/phrases/add', { attemptId: a.id, index: Number(b.dataset.k) }); b.textContent = '已在片語本'; }
+    catch (e) { b.disabled = false; alert(e.message); }
+  });
+  document.getElementById('ask').onsubmit = async ev => {
+    ev.preventDefault();
+    const f = ev.target; const btn = f.querySelector('button');
+    const q = f.q.value.trim();
+    if (!q) return;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await api('/api/gsat/ask', { attemptId: a.id, question: q });
+      document.getElementById('chat').innerHTML = chat(r.chat);
+      f.q.value = '';
+    } catch (e) { alert(e.message); }
+    btn.disabled = false; btn.textContent = '問';
+  };
+}
+
+async function gsatBank() {
+  setView(loading(), { tab: 'bank' });
+  const rows = await api('/api/gsat/bank');
+  const row = r => `<a class="brow" href="#/gsat/practice?id=${r.id}">
+      <div class="spacer"><b>${esc(r.label || '新題')}</b><div class="muted small">${esc(r.first || '')}</div></div>
+      ${r.tries ? `<b class="bscore ${r.best >= 7 ? 'good' : ''}">${fmtPts(r.best)}<small>/8</small></b>` : '<span class="muted small">未練習</span>'}</a>`;
+  const past = rows.filter(r => r.source === 'past');
+  const ai = rows.filter(r => r.source !== 'past');
+  setView(`<main class="stack">
+    <h2>題庫</h2>
+    <p class="muted small">分數是你在這組的最高分。93–110 年每年有兩組（學測與指考），111 年起是新制，每年一組。</p>
+    <h3 class="sec">新制考古題（111 年起）</h3><div>${past.filter(r => r.year >= 111).map(row).join('')}</div>
+    <h3 class="sec">93–110 年</h3><div>${past.filter(r => r.year < 111).map(row).join('')}</div>
+    <div class="row"><h3 class="sec spacer">AI 新題</h3><button class="btn ghost small" id="gen">出 3 組新題</button></div>
+    <div>${ai.map(row).join('') || '<p class="muted small">還沒有。按「出 3 組新題」會依你常錯的地方出題（算 1 次 AI）。</p>'}</div>
+  </main>`, { tab: 'bank' });
+  document.getElementById('gen').onclick = async e => {
+    const b = e.currentTarget; b.disabled = true; b.textContent = '出題中，約 30 秒…';
+    try { await api('/api/gsat/generate', {}); gsatBank(); } catch (err) { alert(err.message); b.disabled = false; b.textContent = '出 3 組新題'; }
+  };
+}
+
+async function gsatPhrases() {
+  setView(loading(), { tab: 'phrases' });
+  const { phrases, due } = await api('/api/gsat/phrases');
+  setView(`<main class="stack">
+    <h2>片語本</h2>
+    ${due ? `<a class="btn block" href="#/gsat/phrases/review">複習 ${due} 個到期的片語</a>` : '<p class="muted small">今天沒有到期的片語。</p>'}
+    <p class="muted small">批改結果裡按「＋ 片語本」就會加進來。複習間隔是第 1、2、4、7、14、21、45、90 天，答錯明天重來。</p>
+    <div>${phrases.map(p => `<details class="wrow"><summary><b>${esc(p.phrase)}</b><span class="spacer"></span>
+        <span class="muted small">${esc(p.zh)}</span><span class="muted small due">${dueLabel(p.due_day)}</span></summary>
+        ${p.example ? `<p class="gex">${esc(p.example)}</p><p class="muted small">${esc(p.example_zh)}</p>` : ''}
+        ${p.note ? `<p class="why small">${esc(p.note)}</p>` : ''}
+        <button class="link small delp" data-id="${p.id}">從片語本刪除</button></details>`).join('') || '<p class="muted">片語本還是空的。</p>'}</div>
+  </main>`, { tab: 'phrases' });
+  $app.querySelectorAll('.delp').forEach(b => b.onclick = async () => {
+    if (!confirm('確定刪除這個片語？')) return;
+    await api('/api/gsat/phrases/delete', { id: Number(b.dataset.id) });
+    gsatPhrases();
+  });
+}
+
+// Compare typed phrases loosely: case, punctuation and placeholders (..., sth, sb, someone) don't matter.
+const phraseKey = s => String(s).toLowerCase().replace(/\.{2,}|…/g, ' ').replace(/\b(sth|sb|someone|something|one's|oneself|a|b|n|v|v-ing|ving)\b/g, ' ')
+  .replace(/[^a-z' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+async function gsatPhraseReview() {
+  setView(loading(), { focus: true });
+  const list = await api('/api/gsat/phrases/review');
+  let i = 0; let right = 0;
+  const done = () => setView(`<main class="stack"><h2>片語複習完成</h2><p>${list.length ? `答對 ${right} / ${list.length} 個。` : '今天沒有到期的片語。'}</p>
+    <a class="btn block" href="#/">回到今天</a><a class="btn ghost block" href="#/gsat/phrases">看片語本</a></main>`, { tab: 'phrases' });
+  const show = () => {
+    if (i >= list.length) return done();
+    const p = list[i];
+    setView(`<div class="ptop"><a class="link" href="#/gsat/phrases" aria-label="離開">✕</a><span class="title">片語複習</span><span class="spacer"></span>
+      <span class="muted small">${i + 1} / ${list.length}</span></div>
+      <main class="stack">
+        <p class="muted small">看中文，寫出英文片語或句型。</p>
+        <p class="vzh" style="text-align:center">${esc(p.zh)}</p>
+        ${p.example_zh ? `<p class="muted" style="text-align:center">${esc(p.example_zh)}</p>` : ''}
+        <input class="text" id="pin" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="英文片語">
+        <div id="pback"></div><div class="btn-grid" id="pbtns"><button class="btn block" id="check">看答案</button></div></main>`, { focus: true });
+    const input = document.getElementById('pin');
+    input.focus();
+    const grade = async result => {
+      if (result === 'good') right++;
+      await api('/api/gsat/phrases/grade', { id: p.id, result }).catch(() => {});
+      i++; show();
+    };
+    const check = () => {
+      const ok = input.value.trim() && phraseKey(input.value) === phraseKey(p.phrase);
+      input.disabled = true;
+      document.getElementById('pback').innerHTML = `<div class="card"><p class="${ok ? 'right' : ''}"><b>${esc(p.phrase)}</b></p>
+        ${p.example ? `<p class="gex">${esc(p.example)}</p>` : ''}${p.note ? `<p class="why small">${esc(p.note)}</p>` : ''}
+        ${input.value.trim() ? `<p class="muted small">你寫的：${esc(input.value)}</p>` : ''}</div>`;
+      document.getElementById('pbtns').innerHTML = `<button class="btn ghost block" id="again">答錯了</button><button class="btn block" id="good">答對了</button>`;
+      document.getElementById('again').onclick = () => grade('again');
+      document.getElementById('good').onclick = () => grade('good');
+      document.getElementById(ok ? 'good' : 'again').focus();
+    };
+    document.getElementById('check').onclick = check;
+    input.onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); check(); } };
+  };
+  show();
+}
+
+function scoreChart(points, max, label) {
+  if (points.length < 2) return '';
+  const W = 640, H = 140, P = 8;
+  const x = k => P + (k / (points.length - 1)) * (W - 2 * P);
+  const y = v => H - P - (v / max) * (H - 2 * P);
+  const d = points.map((v, k) => `${k ? 'L' : 'M'}${x(k).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">
+    <line x1="${P}" x2="${W - P}" y1="${y(6)}" y2="${y(6)}" stroke="var(--red)" stroke-dasharray="4 4"/>
+    <text x="${W - P}" y="${y(6) - 6}" text-anchor="end" fill="var(--red)" font-size="14">6 分</text>
+    <path d="${d}" fill="none" stroke="var(--ink)" stroke-width="2.5"/>
+    ${points.map((v, k) => `<circle cx="${x(k)}" cy="${y(v)}" r="3.5" fill="var(--ink)"/>`).join('')}</svg>`;
+}
+
+async function gsatProgress() {
+  setView(loading(), { tab: 'progress' });
+  const p = await api('/api/gsat/progress');
+  setView(`<main class="stack">
+    <h2>學測翻譯進度</h2>
+    <div class="wstats g3">
+      <div><b>${p.recentAvg == null ? '—' : fmtPts(Math.round(p.recentAvg * 10) / 10)}</b><span>近 10 組平均</span></div>
+      <div><b>${p.best == null ? '—' : fmtPts(p.best)}</b><span>最高分</span></div>
+      <div><b>${p.past.done}<small>/${p.past.total}</small></b><span>考古題完成</span></div></div>
+    ${p.trend.length > 1 ? `<h3>分數走勢（滿分 8）</h3>${scoreChart(p.trend, 8, '學測翻譯分數走勢')}` : ''}
+    <h3>最常犯的錯（最近 20 次）</h3>
+    ${p.errors.length ? `<div class="ebars">${p.errors.map(e => `<div class="ebar"><span>${esc(e.label)}</span>
+        <div class="meter"><span style="width:${Math.round(e.share * 100)}%"></span></div><b>${e.count}</b></div>`).join('')}</div>`
+      : '<p class="muted small">還沒有資料。</p>'}
+    <h3>練習紀錄</h3>
+    ${p.history.length ? `<ul class="hist">${p.history.map(h => `<li><a href="#/gsat/result/${h.id}"><span class="spacer">${esc(h.label || '新題')}${h.mode === 'rewrite' ? '<span class="tag plain">重寫</span>' : ''}
+        <span class="muted small" style="display:block">${esc(h.first || '')}</span></span>
+        <span class="muted small">${esc(String(h.day).slice(5))}</span><b>${fmtPts(h.score)}<small>/8</small></b></a></li>`).join('')}</ul>`
+      : '<p class="muted">還沒有練習紀錄。</p>'}
   </main>`, { tab: 'progress' });
 }
 
 // ---------- Settings ----------
 async function settingsView() {
   setView(loading(), { tab: 'settings' });
-  const { plan, vocabSettings: vs } = await api('/api/today');
-  const s = plan.settings;
-  setView(`<main class="stack"><h2>設定</h2>
-    <form id="settings">
+  const me = await api('/api/me');
+  ME = me;
+  const subjects = ME.subjects || [];
+  const switcher = subjects.length > 1 ? `<h2>科目</h2>
+    <div class="seg" role="group" aria-label="切換科目">${subjects.map(k => `<a href="#/choose?to=${k}" class="${k === SUBJECT ? 'on' : ''}"${k === SUBJECT ? ' aria-current="page"' : ''}>${esc(SUBJECT_INFO[k].name)}</a>`).join('')}</div>` : '';
+  let form;
+  if (SUBJECT === 'gsat') {
+    const g = await api('/api/gsat/settings');
+    form = `<h2>學測翻譯</h2><form id="settings">
+      <label class="field"><span>每組作答時間（分鐘，0 = 不計時）</span><input class="text" type="number" min="0" max="60" step="1" name="timerMinutes" value="${g.timerMinutes}"></label>
+      <p class="muted small">正式考試翻譯沒有單題限時，整份英文考科 100 分鐘。想模擬考場節奏，可以設 6–8 分鐘一組。設了時間，超時會變紅提醒，但仍然可以送出。</p>
+      <label class="field"><span>每天練習幾組（一組兩句）</span><input class="text" type="number" min="1" max="6" step="1" name="dailySets" value="${g.dailySets}"></label>
+      <button class="btn block" style="margin-top:20px">儲存</button>
+      <p class="muted small" id="saved" hidden>已儲存。</p></form>`;
+  } else {
+    const { plan, vocabSettings: vs } = await api('/api/today');
+    const s = plan.settings;
+    form = `<h2>TOEFL</h2><form id="settings">
       <label class="field"><span>考試日期</span><input class="text" type="date" name="examDate" value="${esc(s.examDate)}" required></label>
       <label class="field"><span>目標總分（1–6 級；舊制 100 分約等於 5.0）</span>
         <select class="text" name="target">${[3.5, 4, 4.5, 5, 5.5, 6].map(v => `<option ${v === s.target ? 'selected' : ''} value="${v}">${v.toFixed(1)}</option>`).join('')}</select></label>
@@ -798,18 +1781,36 @@ async function settingsView() {
       <label class="field"><span>週末每天練習（分鐘）</span><input class="text" type="number" min="15" max="300" step="5" name="minutesWeekend" value="${s.minutesWeekend}"></label>
       <label class="field"><span>每天挑幾個新單字</span><input class="text" type="number" min="5" max="150" step="5" name="vocabNewPerDay" value="${vs.newPerDay}"></label>
       <button class="btn block" style="margin-top:20px">儲存</button>
-      <p class="muted small" id="saved" hidden>已儲存，今天的任務已重新安排。</p>
-    </form>
+      <p class="muted small" id="saved" hidden>已儲存，今天的任務已重新安排。</p></form>`;
+  }
+  setView(`<main class="stack"><h2 class="sr-only">設定</h2>
+    ${switcher}
+    ${form}
+    <h2>帳號</h2>
+    <p>${esc(ME?.email || '')}</p>
+    ${ME?.usage ? `<p class="muted small">今天已用 AI ${ME.usage.used} / ${ME.usage.limit} 次（出題、批改、追問、單字卡各算一次，兩個科目共用，台灣時間午夜重置）</p>` : ''}
     <button class="btn ghost block" id="logout">登出</button></main>`, { tab: 'settings' });
   document.getElementById('settings').onsubmit = async ev => {
     ev.preventDefault();
     const f = ev.target;
-    await api('/api/settings', { examDate: f.examDate.value, target: Number(f.target.value), minutesWeekday: Number(f.minutesWeekday.value), minutesWeekend: Number(f.minutesWeekend.value), vocabNewPerDay: Number(f.vocabNewPerDay.value) });
+    if (SUBJECT === 'gsat') {
+      const saved = await api('/api/gsat/settings', { timerMinutes: Number(f.timerMinutes.value), dailySets: Number(f.dailySets.value) });
+      f.timerMinutes.value = saved.timerMinutes; f.dailySets.value = saved.dailySets;
+    } else {
+      await api('/api/settings', { examDate: f.examDate.value, target: Number(f.target.value), minutesWeekday: Number(f.minutesWeekday.value), minutesWeekend: Number(f.minutesWeekend.value), vocabNewPerDay: Number(f.vocabNewPerDay.value) });
+    }
     document.getElementById('saved').hidden = false;
   };
-  document.getElementById('logout').onclick = async () => { await api('/api/logout', {}); loginView(); };
+  document.getElementById('logout').onclick = logout;
 }
 
 // ---------- boot ----------
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+// Coming back from an email confirmation link: the session arrives in the URL hash.
+if (/access_token=/.test(location.hash)) {
+  const p = new URLSearchParams(location.hash.slice(1));
+  session.set({ access_token: p.get('access_token'), refresh_token: p.get('refresh_token'),
+    expires_at: Number(p.get('expires_at')) || Math.floor(Date.now() / 1000) + Number(p.get('expires_in') || 3600) });
+  history.replaceState(null, '', location.pathname + location.search + '#/');
+}
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 route();

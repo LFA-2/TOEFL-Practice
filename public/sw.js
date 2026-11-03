@@ -1,7 +1,7 @@
 // Network-first for the app shell so updates show up immediately; cached copy when offline.
-// API calls are never cached.
-const CACHE = 'toefl-coach-v3';
-const SHELL = ['/', '/index.html', '/app.js', '/style.css', '/manifest.webmanifest', '/icon.svg'];
+// Only same-origin GETs are handled; the API (Supabase) is never cached.
+const CACHE = 'toefl-coach-v7';
+const SHELL = ['./', 'index.html', 'app.js', 'config.js', 'style.css', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -14,10 +14,10 @@ self.addEventListener('activate', e => {
 
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
-  if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) return;
+  if (e.request.method !== 'GET' || url.origin !== location.origin) return;
   e.respondWith(
-    fetch(e.request)
+    fetch(e.request, { cache: 'no-cache' })
       .then(res => { const copy = res.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); return res; })
-      .catch(() => caches.match(e.request).then(r => r || caches.match('/index.html')))
+      .catch(() => caches.match(e.request).then(r => r || caches.match('index.html')))
   );
 });

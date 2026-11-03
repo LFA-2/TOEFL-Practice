@@ -1,169 +1,162 @@
 # TOEFL Coach
 
-為 2026 新制 TOEFL iBT 量身打造的個人練習 app。依考試日期、目標級分和每個題型的能力估計，每天自動排出練習任務；寫作由 Claude 批改。
+兩個科目的英文練習 app，登入後選一個：
 
-- 零依賴：只用 Node.js 內建模組（`node:http`、`node:sqlite`），**不需要 `npm install`**
-- PWA：手機瀏覽器「加入主畫面」即可當 app 用
-- 資料存在 `data/toefl.db`（SQLite 單一檔案，備份就是複製這個檔）
+- **TOEFL iBT**（2026 新制）：依考試日期、目標級分和每個題型的能力估計，每天自動排出練習任務；寫作由 Claude 批改，單字有每日篩選、單字卡與間隔複習。
+- **學測翻譯**：93–114 年考古題和 AI 新題，依大考中心評分原則批改，像家教一樣講解，並整理片語本。
 
-## 目前功能（v0.1）
+- **前端**：`public/`，原生 JS 的 PWA，放在 GitHub Pages。手機、筆電都能用，可「加入主畫面」。
+- **後端**：Supabase。Postgres 存資料、Auth 管帳號、一個 Edge Function（`supabase/functions/api`）負責出題、計分、排程和呼叫 Claude。
+- 不需要自己的主機，不需要 Tailscale。
+
+## 安全設計
+
+- **Claude API key 只存在 Supabase secrets**，只有 Edge Function 讀得到，不在前端、不在 repo。
+- 前端的 `publishableKey` 本來就是公開的，它只能讓瀏覽器連到 Supabase；誰能讀寫什麼由資料庫的 Row Level Security 決定。
+- **每張表都開了 RLS**：每個人只能讀寫自己的資料，而且帳號要先被核准。Edge Function 的查詢也是以登入者的身分執行，同樣受 RLS 限制。
+- **註冊需要核准**：任何人都能註冊，但新帳號是「等待核准」，核准前不能使用任何功能、也不能呼叫 Claude。
+- **AI 次數上限**：每人每天 30 次（台灣時間午夜重置），全站每天 300 次。出一題、批改一篇、產生一批單字卡（10 個字）各算一次。超過上限時 AI 功能暫停，已經產生好的題目和單字卡照常可用。
+- Edge Function 只接受固定的操作（例如「產生一題 ctw」），prompt 和模型都寫死在伺服器端，不能被拿來當成任意呼叫 Claude 的代理。
+
+## 第一次部署
+
+需要：Supabase 專案（東京 `ap-northeast-1`，ref：`kubztmahbfpynoskcysd`）、一台有 Node.js 的電腦（工作站即可，只有部署時用到）。
+
+舊專案在愛爾蘭（`eu-west-1`，ref：`sfgsxkglfqyulxyryxtw`），已暫停並保留，不要刪除、不要再部署上去。
+
+### 1. Supabase 後台設定
+
+到 <https://supabase.com/dashboard/project/kubztmahbfpynoskcysd>：
+
+1. **Authentication → Sign In / Providers → Email**
+   - 關閉 **Confirm email**。Supabase 內建的寄信服務只會寄給專案成員，其他人收不到確認信；註冊改由你手動核准把關。
+   - **Minimum password length** 設成 8。
+2. **Authentication → URL Configuration**：Site URL 填網站網址（第 3 步會得到），例如 `https://lfa-2.github.io/TOEFL-Practice/`。
+
+### 2. 部署資料庫和 Edge Function
+
+在工作站上（另外 clone 一份，不影響舊的服務）：
+
+```bash
+git clone -b supabase https://github.com/LFA-2/TOEFL-Practice.git ~/toefl-supabase
+cd ~/toefl-supabase
+
+npx supabase login                                     # 會開瀏覽器登入 Supabase
+npx supabase link --project-ref kubztmahbfpynoskcysd   # 會問資料庫密碼（建立專案時設的）
+npx supabase db push --remote                         # 建立資料表、RLS、題庫起始題目
+
+npx supabase secrets set ANTHROPIC_API_KEY=sk-ant-...  # 你的 Claude API key，只存在 Supabase
+npx supabase functions deploy api --no-verify-jwt
+```
+
+> `--no-verify-jwt`：登入檢查由 function 自己做（向 Supabase Auth 確認 token），不是關掉檢查。
+> 如果 `functions deploy` 說需要 Docker，改用 `npx supabase functions deploy api --no-verify-jwt --use-api`。
+
+為了避免 API key 留在 shell 歷史裡，可以改成：
+
+```bash
+read -rs KEY && npx supabase secrets set ANTHROPIC_API_KEY="$KEY" && unset KEY
+```
+
+### 3. 發佈網站（GitHub Pages）
+
+1. GitHub repo → **Settings → Pages** → Source 選 **GitHub Actions**。
+2. **Settings → Environments → github-pages → Deployment branches**：加入 `supabase`（合併到 `main` 之前測試用）。
+3. 推一次 commit 或到 **Actions → Deploy site to GitHub Pages → Run workflow**。網址是 `https://lfa-2.github.io/TOEFL-Practice/`。
+
+> 私人 repo 要用 GitHub Pages 需要 GitHub Pro（學生可以從 GitHub Student Developer Pack 免費取得）。不想用的話，可以用 Cloudflare Pages：連結這個 repo，Build command 留空，Output directory 填 `public`。
+
+### 4. 註冊你的帳號，搬舊資料
+
+1. 打開網站，用 Email 註冊。畫面會顯示「等待核准」。
+2. 在工作站產生匯入用的 SQL（用最新的備份）：
+
+   ```bash
+   cd ~/TOEFL-Practice && rm -f ~/toefl-backup.db && node -e 'const {DatabaseSync}=require("node:sqlite");new DatabaseSync("data/toefl.db").exec(`VACUUM INTO '\''${process.env.HOME}/toefl-backup.db'\''`)'
+   cd ~/toefl-supabase && node tools/sqlite-to-sql.js ~/toefl-backup.db 你的Email > ~/import.sql
+   ```
+
+3. Supabase 後台 → **SQL Editor** → 貼上 `~/import.sql` 的內容 → Run。它會核准你的帳號，並匯入題目、作答紀錄、能力估計、單字和複習紀錄。同一個帳號重複執行會被擋下來，不會重複匯入。
+4. 回到網站按「重新檢查」。
+
+### 5. 停掉舊的服務
+
+確認新版沒問題之後：
+
+```bash
+systemctl --user disable --now toefl-coach.service toefl-generate.timer
+sudo tailscale serve reset
+```
+
+舊的 `~/TOEFL-Practice/data/toefl.db` 可以留著當備份。
+
+## 日常管理
+
+- **核准新帳號**：Supabase 後台 → Table Editor → `profiles` → 把該列的 `approved` 勾起來。
+- **調整 AI 次數**：`app_config` 表的 `ai_daily_limit`（每人）和 `ai_global_daily_limit`（全站）；個別帳號可以在 `profiles.ai_daily_limit` 設不同的上限（空白 = 用預設）。
+- **看用量**：`ai_usage` 表，每人每天一列。網站「設定」頁也會顯示今天用了幾次。
+- **費用保險**：在 Anthropic Console → Limits 設每月消費上限。這把 key 只給這個專案用，外洩時直接在 Console 撤銷再換新的。
+- **限制帳號能用的科目**：`profiles.subjects`，預設 `{toefl,gsat}`；只給學測翻譯就改成 `{gsat}`，這個帳號登入後會直接進學測翻譯，也不能呼叫 TOEFL 的 API。
+- **停用某個帳號**：把 `approved` 取消勾選，或在 Authentication → Users 刪除（資料會一起刪除）。
+
+## 更新
+
+- **只改前端（`public/`）**：推上 GitHub，Actions 會自動發佈。
+- **改了 Edge Function**：`npx supabase functions deploy api --no-verify-jwt`
+- **加了 migration**：`npx supabase db push --remote`
+
+## 功能
 
 | 科目 | 題型 | 批改 |
 |---|---|---|
 | 閱讀 | Complete the Words、Read in Daily Life、Read an Academic Passage | 自動 |
+| 聽力 | Listen and Choose a Response、Conversation、Announcement、Academic Talk | 自動 |
+| 口說（打字版） | Listen and Repeat | 自動（逐字比對，每句 0–5 分） |
+| 口說（打字版） | Take an Interview | Claude（4 題一起批，0–5 分 + 每題建議） |
 | 寫作 | Build a Sentence | 自動 |
 | 寫作 | Write an Email、Academic Discussion | Claude（0–5 分 + 逐句修改 + 範文） |
-| 單字 | 每日篩選新字、單字卡、間隔複習 | 自動 |
+| 單字 | 每日篩選新字、單字卡、選擇題與拼字測驗、間隔複習、自由測驗 | 自動 |
 
-- **單字填空**照 ETS 官方格式：第一句完整，之後每隔一個字刪掉後半段，共 10 格，一格一個字母，拼字必須完全正確。
-- **句子重組**照實際考法：回覆句裡有部分字固定，其餘空格從字塊填入，可能有一個用不到的干擾字塊，每題 41 秒。
+- **單字填空**照 ETS 官方格式：第一句完整，之後每隔一個字刪掉後半段，共 10 格，一格一個字母。
+- **句子重組**照實際考法：部分字固定，其餘空格從字塊填入，可能有一個干擾字塊，每題 41 秒。
+- **題庫共用**：AI 產生的題目所有核准的使用者都能練到（作答紀錄各自獨立），可以省下 AI 次數。
+- **單字卡**在挑字時每滿 10 個字產生一批，剩下的在開始複習時補齊。
+- **間隔複習**：第 1、2、4、7、14、21、45、90 天。剛挑的字當天先考選擇題、再考拼字；答錯當天再考一次，明天從頭開始。
+- **能力估計**：每個題型一個 1–6 級分。選擇題用類似 Elo 的方式更新；寫作把 0–5 分換算成級分（分數 +1）後逐步逼近。題目難度挑略高於目前能力（+0.25）。
+- **每日計畫**：依「目標 − 目前能力」與題型配分分配時間，順序跟考試一樣（閱讀、聽力、口說、寫作），每天至少一項聽力和一項口說；考前四週模考期加重聽力，最後一週減量。單字最多佔一半時間。
+- **聽力與口說的聲音**用瀏覽器內建語音（免費），對話會用兩種聲音。題目要聽完才出現；診斷時只能聽一次，平常練習可以重聽，次數會記錄。瀏覽器沒有英文語音時會提示，可以改看文字作答。
+- **口說是打字版**：只評內容、組織和用字，不含發音與流暢度。分數另外顯示，不算進總分。模擬面試每題 90 秒（正式考試說 45 秒）。
+- **進度頁**的過去練習依科目和題型分類；信件、學術討論和模擬面試另有「寫作與口說紀錄」可看完整作答與批改。
 
-### 單字
+### 學測翻譯
 
-1. **挑新單字**：一次一個字，只顯示英文，點「會／不熟／不會」。「會」的字之後不再出現；另外兩種加進單字本。每天的數量在「設定」調整（預設 60）。
-2. **單字卡**：只替你挑出來的字產生，內容有中文意思、詞性、學術例句、常見搭配、詞性變化，以及一題選擇題（新例句＋三個陷阱選項＋說明）。用較便宜的 Haiku 模型。
-3. **兩種題型**，都自動批改：
-   - **句子填空選字**：新例句挖空，四選一。陷阱是意思很像但放不進這句的字，或長得很像的字；答完說明每個錯誤選項為什麼不行。
-   - **看中文打英文**：給中文、詞性和挖空的例句，格子數等於字母數，不給字母。可以按「提示」看第一個字母，但只算「模糊」。
-4. **間隔複習**：第 1、2、4、7、14、21、45、90 天。
-   - 剛挑進來的字當天先考選擇題（附中文提示），答對再考一次打字，明天再出現
-   - 之後以打字為主，每三次穿插一次選擇題；剛答錯的字重考時改考選擇題
-   - 答對往下一個間隔；用了提示或打成意思接近的字，間隔不變；答錯當天再考一次，明天從頭開始
-5. **自由測驗**：隨時從單字本抽 20 個字（偏重常錯的），答錯會拉回明天複習，答對不會提前往後推。也可以只考難字。
-6. **難字**：累計答錯 4 次以上的字，單字本可以篩選出來。
-7. 候選字的難度會跟著你的回答調整：大多會就變難，大多不會就變簡單。
-8. 單字最多佔每天練習時間的一半。
+- **題庫**：93–114 年考古題共 40 組（93–110 年每年兩組，來自學測與指考；111 年起新制每年一組），每組兩句。考古題沒有官方答案，第一次練到某組時由 Claude 產生計分用的分段、參考譯法和提示，存起來給所有人共用（只花一次 AI）。考古題做完後改出 AI 新題，一次出 3 組，會參考你最近常錯的地方。
+- **計分照大考中心原則**：每句 4 分，依意思分成前後兩部分各 2 分、分開計分；每個錯誤扣 0.5 分，扣到該部分 0 分為止；整個部分沒翻或全錯該部分 0 分；相同拼字或文法錯誤只扣一次；句首未大寫、標點不妥各扣 0.5 分只扣一次。Claude 只負責列出錯誤，分數由程式依規則計算，畫面上每 0.5 分都標出原因。
+- **家教式回饋**：錯誤標在你的句子上並逐一說明、保留原句型的最小修改、更道地的寫法、參考譯法、值得記的片語和句型（附例句，用對了會標出來）、常見陷阱、下次的重點。可以「重寫一次」看分數進步，也可以針對這組「問家教」（每組最多 8 題，每題 1 次 AI）。
+- **片語本**：回饋裡的片語一鍵加入，看中文寫英文，間隔 1、2、4、7、14、21、45、90 天。
+- **每天**：預設 2 組，先複習沒拿到 7 分且超過 3 天的題目，再做新題。作答時間可以在設定調整（0 = 不計時）。
+- 考古題來源：大考中心歷屆試題，文字整理自駱駝英文；資料在 `tools/gsat-past.json`，改完執行 `node tools/gsat-seed-sql.js` 產生 seed migration。
 
-下一版：聽力（TTS 音檔）、口說（打字版）、錯題本、全真模考。
+下一版：TOEFL 錯題本、全真模考。
 
-### 運作方式
+## 程式結構
 
-- **診斷**：第一天每個題型各做一點，建立起點。
-- **能力估計**：每個題型一個 1–6 級分的估計值。選擇題用類似 Elo 的方式更新；寫作把 0–5 分換算成級分（分數 +1）後逐步逼近。
-- **適性出題**：挑難度略高於你目前能力（+0.25）的題目，題庫不夠時即時請 Claude 出題，背景會再補幾題。
-- **每日計畫**：依「目標 − 目前能力」的差距和該題型在考試中的配分分配時間；考前四週進入模考期，最後一週減量。
+- `public/`：前端。`config.js` 是 Supabase 網址和 publishable key。
+- `supabase/migrations/`：資料表、RLS、核准機制、AI 次數函式、起始題目。
+- `supabase/functions/api/index.ts`：Edge Function 入口（Deno）。
+- `supabase/functions/api/app.js`：路由、登入檢查、AI 次數扣除。
+- `supabase/functions/api/lib/`：`tasks.js` 題型與計分、`skills.js` 能力估計、`plan.js` 每日計畫、`bank.js` 選題與作答、`vocab.js` 單字、`gsat.js` 學測翻譯（選題、計分、片語本）、`ai.js` Claude prompt。
+- `tools/sqlite-to-sql.js`：把舊版 SQLite 備份轉成匯入用的 SQL。
+- `tools/gsat-past.json`、`tools/gsat-seed-sql.js`：學測翻譯考古題和產生 seed 的程式。
+- `test/`：本機測試環境（不連網路）。
 
-## 部署到 Arch 工作站
+## 本機開發與測試
 
-### 1. 安裝 Node.js（需要 22.13 以上）
-
-```bash
-sudo pacman -S nodejs
-node -v   # 確認 >= 22.13
-```
-
-### 2. 下載程式碼
+需要本機的 PostgreSQL（16 以上）。`test/dev-server.mjs` 會模擬 Supabase Auth，並用真的 Edge Function 程式碼連本機資料庫；`AI_MOCK=1` 時不呼叫 Claude。
 
 ```bash
-cd ~
-git clone https://github.com/LFA-2/TOEFL-Practice.git
-cd TOEFL-Practice
-```
-
-### 3. 建立 `.env`（設定檔）
-
-`.env` 是放「密碼」和「API key」這類機密的檔案。它已經被 `.gitignore` 排除，**不會**被推上 GitHub。
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-填兩個值：
-
-- `APP_PASSWORD`：你從手機登入用的密碼，設長一點。
-- `ANTHROPIC_API_KEY`：到 <https://console.anthropic.com> → Settings → API keys 建立一把 key（需要先在 Billing 儲值，幾美元就夠用很久），貼進來。
-
-```bash
-chmod 600 .env   # 只有你自己能讀
-```
-
-### 4. 先手動跑一次確認
-
-```bash
-node server.js
-# 看到 TOEFL Coach listening on http://127.0.0.1:3000 就成功了
-# 在工作站上：curl http://127.0.0.1:3000/api/me
-```
-
-按 Ctrl+C 停掉。
-
-### 5. 設成開機自動啟動（systemd user service）
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp deploy/toefl-coach.service deploy/toefl-generate.service deploy/toefl-generate.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now toefl-coach.service toefl-generate.timer
-sudo loginctl enable-linger $USER   # 沒登入時服務也繼續跑
-systemctl --user status toefl-coach
-```
-
-> 如果 repo 不是放在 `~/TOEFL-Practice`，要改 `.service` 檔裡的 `WorkingDirectory`。
-
-`toefl-generate.timer` 每天凌晨 3:30 用 Claude 補題、準備隔天要篩選的單字和單字卡，讓你白天在手機上作答不用等。
-
-### 6. 讓手機連得到（需要 HTTPS）
-
-二選一：
-
-**A. Tailscale（推薦，不需要網域）**：工作站和手機都裝 Tailscale、登入同一個帳號，然後：
-
-```bash
-sudo pacman -S tailscale
-sudo systemctl enable --now tailscaled
-sudo tailscale up
-sudo tailscale serve --bg 3000
-```
-
-會得到 `https://<機器名>.<tailnet>.ts.net` 這種網址，只有你自己的裝置連得到。
-
-**B. Cloudflare Tunnel（需要一個放在 Cloudflare 的網域）**：
-
-```bash
-sudo pacman -S cloudflared
-cloudflared tunnel login
-cloudflared tunnel create toefl
-cloudflared tunnel route dns toefl toefl.你的網域.com
-# 設定 ~/.cloudflared/config.yml 把 toefl.你的網域.com 指到 http://127.0.0.1:3000
-```
-
-### 7. 手機安裝
-
-用手機開那個 HTTPS 網址 → 登入 → iPhone 按「分享 → 加入主畫面」；Android 按選單裡的「安裝應用程式」。
-
-## 更新
-
-```bash
-cd ~/TOEFL-Practice && git pull && systemctl --user restart toefl-coach
-```
-
-如果 `deploy/` 裡的 systemd 檔有改，再多跑一次：
-
-```bash
-cp deploy/toefl-*.service deploy/toefl-*.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
-```
-
-資料庫的新資料表會在啟動時自動建立，舊的練習紀錄不受影響。手機上如果看到舊畫面，關掉 app 再打開一次。
-
-## 開發
-
-```bash
-AI_MOCK=1 node --watch server.js     # 不呼叫 API，用假資料測試
-```
-
-- `server.js`：HTTP 路由
-- `lib/tasks.js`：題型定義、Complete the Words 挖空、選擇題計分
-- `lib/skills.js`：能力估計
-- `lib/plan.js`：每日計畫
-- `lib/bank.js`：選題、出題、作答紀錄
-- `lib/vocab.js`：單字篩選、單字卡、間隔複習
-- `lib/ai.js`：Claude 出題與批改的 prompt
-- `lib/seed.js`：內建的起始題目
-- `public/`：前端（原生 JS）
-
-## 備份
-
-```bash
-sqlite3 data/toefl.db ".backup data/backup-$(date +%F).db"
+export PGHOST=/var/run/postgresql PGPORT=5432 PGSOCKET=/var/run/postgresql/.s.PGSQL.5432 PGDATABASE=toefl
+test/reset-db.sh          # 建立資料庫：Supabase 替身 + 所有 migration
+npm run dev               # http://127.0.0.1:3999
+npm test                  # API 測試：登入、核准、RLS 隔離、AI 次數上限、單字流程
 ```
