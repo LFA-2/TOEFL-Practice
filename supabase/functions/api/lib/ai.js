@@ -16,13 +16,59 @@ const STRS = { type: 'array', items: STR };
 const obj = (properties, required = Object.keys(properties)) => ({ type: 'object', required, properties });
 
 // Tool input sometimes still carries a nested array or object as a JSON string ("[{...}]"); parse those back.
+// Such strings are not always valid JSON (a slip, or cut off), so this is lenient: small slips are repaired,
+// and from a broken array every complete element is kept.
 function revive(v) {
   if (Array.isArray(v)) return v.map(revive);
   if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, revive(x)]));
   if (typeof v === 'string' && /^\s*[[{]/.test(v)) {
-    try { return revive(JSON.parse(v)); } catch { return v; }
+    const parsed = lenientParse(v);
+    return parsed === undefined ? v : revive(parsed);
   }
   return v;
+}
+
+const repairJson = raw => raw
+  .replace(/}\s*{/g, '},{')            // missing comma between objects
+  .replace(/"\s*\n\s*"/g, '",\n"')     // missing comma between strings on separate lines
+  .replace(/,\s*([}\]])/g, '$1');      // trailing commas
+
+function lenientParse(text) {
+  const t = text.trim();
+  try { return JSON.parse(t); } catch { /* try harder */ }
+  try { return JSON.parse(repairJson(t)); } catch { /* try harder */ }
+  if (t.startsWith('[')) {
+    const items = salvageArray(t);
+    if (items.length) return items;
+  }
+  return undefined;
+}
+
+// The complete top-level elements of a JSON array that may be cut off or broken further on.
+function salvageArray(text) {
+  const out = [];
+  let depth = 0; let inStr = false; let esc = false; let start = -1;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; if (depth === 1 && start === -1) start = i; continue; }
+    if (ch === '[' || ch === '{') {
+      if (depth === 1 && start === -1) start = i;
+      depth++;
+    } else if (ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 1 && start !== -1) {
+        const piece = text.slice(start, i + 1);
+        try { out.push(JSON.parse(piece)); } catch { try { out.push(JSON.parse(repairJson(piece))); } catch { /* skip a broken element */ } }
+        start = -1;
+      }
+      if (depth <= 0) break;
+    }
+  }
+  return out;
 }
 
 // A list field that arrived as a single value becomes a one-item list; missing becomes empty.
@@ -716,7 +762,27 @@ function cleanQuiz(q) {
   };
 }
 
+// Word lists are split into small calls: ten cards in one reply came close to the output limit, and the
+// model then sometimes sent the list as one long (and broken) string. The batch is still charged once.
+const VOCAB_CHUNK = 5;
+
+async function inChunks(list, charge, fn) {
+  if (charge) await charge();
+  const chunks = [];
+  for (let i = 0; i < list.length; i += VOCAB_CHUNK) chunks.push(list.slice(i, i + VOCAB_CHUNK));
+  const results = await Promise.allSettled(chunks.map(c => fn(c)));
+  const ok = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+  const bad = results.filter(r => r.status === 'rejected');
+  if (!ok.length) throw bad[0].reason;
+  if (bad.length) console.error(`[ai] ${bad.length} of ${chunks.length} parts failed, keeping the rest:`, bad[0].reason.message);
+  return ok;
+}
+
 async function vocabCards(words, charge) {
+  return (await inChunks(words, charge, vocabCardsPart)).flat();
+}
+
+async function vocabCardsPart(words) {
   const prompt = `Write a study card for each word: ${words.join(', ')}
 For each word:
 - "pos": part of speech abbreviation (n. / v. / adj. / adv.); if several, the one most common in academic English
@@ -727,15 +793,16 @@ For each word:
 - "family": other useful forms, e.g. [{"w": "analysis", "pos": "n."}]
 - "tip_zh": a short spelling or usage tip in Traditional Chinese, or "" if none
 ${QUIZ_SPEC}
-JSON: {"cards": [{"w", "pos", "zh", "example", "example_zh", "collocations", "family", "tip_zh", "quiz": {"sentence", "distractors": [{"w", "why_zh"}], "synonyms"}}]}`;
+JSON: {"cards": [{"w", "pos", "zh", "example", "example_zh", "collocations", "family", "tip_zh", "quiz": {"sentence", "distractors": [{"w", "why_zh"}], "synonyms"}}]}
+"cards" must be a real JSON array of objects, not a string. Keep every field short.`;
   const schema = { type: 'object', required: ['cards'], properties: { cards: { type: 'array', items: { type: 'object',
     required: ['w', 'pos', 'zh', 'example', 'quiz'],
     properties: { w: STR, pos: STR, zh: STR, example: STR, example_zh: STR, tip_zh: STR,
       collocations: { type: 'array', items: STR },
       family: { type: 'array', items: { type: 'object', properties: { w: STR, pos: STR } } },
       quiz: QUIZ_SCHEMA } } } } };
-  const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 800 + 520 * words.length, model: config.vocabModel, schema },
-    o => must(Array.isArray(o.cards) && o.cards.length >= 1, 'cards'), charge);
+  const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 1000 + 700 * words.length, model: config.vocabModel, schema },
+    o => must(Array.isArray(o.cards) && o.cards.length >= 1, 'cards'), null);
   return out.cards.filter(c => c && typeof c === 'object').map(c => {
     const w = String(c.w || '').toLowerCase();
     const { quiz, ...rest } = c;
@@ -750,15 +817,21 @@ JSON: {"cards": [{"w", "pos", "zh", "example", "example_zh", "collocations", "fa
 
 // Quiz questions for words that already have a card (cards made before quizzes existed, or a bad quiz).
 async function vocabQuizzes(items, charge) {
+  const maps = await inChunks(items, charge, vocabQuizzesPart);
+  return new Map(maps.flatMap(m => [...m]));
+}
+
+async function vocabQuizzesPart(items) {
   const prompt = `For each word below, write a quiz question. The meaning given is the one to test.
 ${items.map(i => `- ${i.word} (${i.pos || ''} ${i.zh || ''})`).join('\n')}
 For each word:
 ${QUIZ_SPEC}
-JSON: {"quizzes": [{"w": string, "quiz": {"sentence", "distractors": [{"w", "why_zh"}], "synonyms"}}]}`;
+JSON: {"quizzes": [{"w": string, "quiz": {"sentence", "distractors": [{"w", "why_zh"}], "synonyms"}}]}
+"quizzes" must be a real JSON array of objects, not a string.`;
   const schema = { type: 'object', required: ['quizzes'], properties: { quizzes: { type: 'array',
     items: { type: 'object', required: ['w', 'quiz'], properties: { w: STR, quiz: QUIZ_SCHEMA } } } } };
-  const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 600 + 320 * items.length, model: config.vocabModel, schema },
-    o => must(Array.isArray(o.quizzes) && o.quizzes.length >= 1, 'quizzes'), charge);
+  const out = await askJson({ system: VOCAB_SYSTEM, prompt, maxTokens: 800 + 450 * items.length, model: config.vocabModel, schema },
+    o => must(Array.isArray(o.quizzes) && o.quizzes.length >= 1, 'quizzes'), null);
   const res = new Map();
   for (const q of out.quizzes) {
     const w = String(q.w || '').toLowerCase();
