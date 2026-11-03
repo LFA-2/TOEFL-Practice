@@ -70,7 +70,7 @@ async function callClaudeJson({ system, prompt, maxTokens = 2500, model = config
     throw new AiError(`Claude API ${res.status}: ${body.slice(0, 300)}`);
   }
   const data = await res.json();
-  if (data.stop_reason === 'max_tokens') throw new AiError('AI 回應太長被截斷');
+  if (data.stop_reason === 'max_tokens') throw Object.assign(new AiError('AI 回應太長被截斷'), { truncated: true });
   const tool = data.content.find(b => b.type === 'tool_use');
   if (tool && tool.input && typeof tool.input === 'object') return revive(tool.input);
   return revive(parseJson(data.content.filter(b => b.type === 'text').map(b => b.text).join('')));
@@ -113,17 +113,27 @@ function validateUnwrapped(got, validate) {
 }
 
 // `charge` counts one call against the user's daily quota (throws when the quota is used up).
+const MAX_OUTPUT_TOKENS = 16000;
+
 async function askJson(opts, validate, charge) {
   if (charge) await charge();
+  // which job this is, for the logs: the first line of the prompt
+  const label = String(opts.prompt || '').split('\n')[0].slice(0, 60);
   let lastErr;
+  let maxTokens = opts.maxTokens || 2500;
   for (let i = 0; i < 3; i++) {
     try {
-      const got = await callClaudeJson(opts);
+      const got = await callClaudeJson({ ...opts, maxTokens });
       return validateUnwrapped(got, validate);
     } catch (e) {
       lastErr = e;
       if (e instanceof AiError && /API_KEY|401|403|credit|balance/i.test(e.message)) break;
-      console.error(`[ai] attempt ${i + 1} failed:`, e.message);
+      console.error(`[ai] attempt ${i + 1} failed (${label}; max_tokens ${maxTokens}):`, e.message);
+      // the same limit would cut it off again: give the next attempt twice the room
+      if (e.truncated) {
+        if (maxTokens >= MAX_OUTPUT_TOKENS) break;
+        maxTokens = Math.min(MAX_OUTPUT_TOKENS, maxTokens * 2);
+      }
     }
   }
   if (lastErr instanceof AiError) throw new AiError(`${lastErr.message}。已自動重試，仍然失敗，請稍後再試。`);
