@@ -1,6 +1,9 @@
 # TOEFL Coach
 
-為 2026 新制 TOEFL iBT 量身打造的練習 app。依考試日期、目標級分和每個題型的能力估計，每天自動排出練習任務；寫作由 Claude 批改，單字有每日篩選、單字卡與間隔複習。
+兩個科目的英文練習 app，登入後選一個：
+
+- **TOEFL iBT**（2026 新制）：依考試日期、目標級分和每個題型的能力估計，每天自動排出練習任務；寫作由 Claude 批改，單字有每日篩選、單字卡與間隔複習。
+- **學測翻譯**：93–114 年考古題和 AI 新題，依大考中心評分原則批改，像家教一樣講解，並整理片語本。
 
 - **前端**：`public/`，原生 JS 的 PWA，放在 GitHub Pages。手機、筆電都能用，可「加入主畫面」。
 - **後端**：Supabase。Postgres 存資料、Auth 管帳號、一個 Edge Function（`supabase/functions/api`）負責出題、計分、排程和呼叫 Claude。
@@ -93,6 +96,7 @@ sudo tailscale serve reset
 - **調整 AI 次數**：`app_config` 表的 `ai_daily_limit`（每人）和 `ai_global_daily_limit`（全站）；個別帳號可以在 `profiles.ai_daily_limit` 設不同的上限（空白 = 用預設）。
 - **看用量**：`ai_usage` 表，每人每天一列。網站「設定」頁也會顯示今天用了幾次。
 - **費用保險**：在 Anthropic Console → Limits 設每月消費上限。這把 key 只給這個專案用，外洩時直接在 Console 撤銷再換新的。
+- **限制帳號能用的科目**：`profiles.subjects`，預設 `{toefl,gsat}`；只給學測翻譯就改成 `{gsat}`，這個帳號登入後會直接進學測翻譯，也不能呼叫 TOEFL 的 API。
 - **停用某個帳號**：把 `approved` 取消勾選，或在 Authentication → Users 刪除（資料會一起刪除）。
 
 ## 更新
@@ -124,7 +128,16 @@ sudo tailscale serve reset
 - **口說是打字版**：只評內容、組織和用字，不含發音與流暢度。分數另外顯示，不算進總分。模擬面試每題 90 秒（正式考試說 45 秒）。
 - **進度頁**的過去練習依科目和題型分類；信件、學術討論和模擬面試另有「寫作與口說紀錄」可看完整作答與批改。
 
-下一版：錯題本、全真模考。
+### 學測翻譯
+
+- **題庫**：93–114 年考古題共 40 組（93–110 年每年兩組，來自學測與指考；111 年起新制每年一組），每組兩句。考古題沒有官方答案，第一次練到某組時由 Claude 產生計分用的分段、參考譯法和提示，存起來給所有人共用（只花一次 AI）。考古題做完後改出 AI 新題，一次出 3 組，會參考你最近常錯的地方。
+- **計分照大考中心原則**：每句 4 分，依意思分成前後兩部分各 2 分、分開計分；每個錯誤扣 0.5 分，扣到該部分 0 分為止；整個部分沒翻或全錯該部分 0 分；相同拼字或文法錯誤只扣一次；句首未大寫、標點不妥各扣 0.5 分只扣一次。Claude 只負責列出錯誤，分數由程式依規則計算，畫面上每 0.5 分都標出原因。
+- **家教式回饋**：錯誤標在你的句子上並逐一說明、保留原句型的最小修改、更道地的寫法、參考譯法、值得記的片語和句型（附例句，用對了會標出來）、常見陷阱、下次的重點。可以「重寫一次」看分數進步，也可以針對這組「問家教」（每組最多 8 題，每題 1 次 AI）。
+- **片語本**：回饋裡的片語一鍵加入，看中文寫英文，間隔 1、2、4、7、14、21、45、90 天。
+- **每天**：預設 2 組，先複習沒拿到 7 分且超過 3 天的題目，再做新題。作答時間可以在設定調整（0 = 不計時）。
+- 考古題來源：大考中心歷屆試題，文字整理自駱駝英文；資料在 `tools/gsat-past.json`，改完執行 `node tools/gsat-seed-sql.js` 產生 seed migration。
+
+下一版：TOEFL 錯題本、全真模考。
 
 ## 程式結構
 
@@ -132,8 +145,9 @@ sudo tailscale serve reset
 - `supabase/migrations/`：資料表、RLS、核准機制、AI 次數函式、起始題目。
 - `supabase/functions/api/index.ts`：Edge Function 入口（Deno）。
 - `supabase/functions/api/app.js`：路由、登入檢查、AI 次數扣除。
-- `supabase/functions/api/lib/`：`tasks.js` 題型與計分、`skills.js` 能力估計、`plan.js` 每日計畫、`bank.js` 選題與作答、`vocab.js` 單字、`ai.js` Claude prompt。
+- `supabase/functions/api/lib/`：`tasks.js` 題型與計分、`skills.js` 能力估計、`plan.js` 每日計畫、`bank.js` 選題與作答、`vocab.js` 單字、`gsat.js` 學測翻譯（選題、計分、片語本）、`ai.js` Claude prompt。
 - `tools/sqlite-to-sql.js`：把舊版 SQLite 備份轉成匯入用的 SQL。
+- `tools/gsat-past.json`、`tools/gsat-seed-sql.js`：學測翻譯考古題和產生 seed 的程式。
 - `test/`：本機測試環境（不連網路）。
 
 ## 本機開發與測試

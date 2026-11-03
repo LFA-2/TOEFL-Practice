@@ -29,7 +29,24 @@ const CFG = window.TOEFL_CONFIG;
 const AUTH = `${CFG.supabaseUrl}/auth/v1`;
 const FN = `${CFG.supabaseUrl}/functions/v1/api`;
 const SESSION_KEY = 'toefl-auth';
-let ME = null; // { email, approved, usage } once checked
+let ME = null; // { email, approved, usage, subjects, subject } once checked
+
+// ---------- subjects: TOEFL or 學測翻譯 ----------
+const SUBJECT_INFO = {
+  toefl: { name: 'TOEFL iBT', title: 'TOEFL Coach', desc: '閱讀、聽力、口說（打字版）、寫作、單字，依考試日排每天的練習。' },
+  gsat: { name: '學測翻譯', title: '學測翻譯練習', desc: '93–114 年考古題和 AI 新題，依大考中心原則批改，像家教一樣講解，並整理片語本。' },
+};
+const TABS = {
+  toefl: [['today', '#/', '今天'], ['vocab', '#/vocab', '單字'], ['progress', '#/progress', '進度'], ['settings', '#/settings', '設定']],
+  gsat: [['today', '#/', '今天'], ['bank', '#/gsat/bank', '題庫'], ['phrases', '#/gsat/phrases', '片語'], ['progress', '#/gsat/progress', '進度'], ['settings', '#/settings', '設定']],
+};
+let SUBJECT = null;
+function setSubject(subject) {
+  SUBJECT = subject;
+  const tabs = TABS[subject] || TABS.toefl;
+  $tabs.innerHTML = tabs.map(([key, href, label]) => `<a href="${href}" data-tab="${key}">${label}</a>`).join('');
+  document.title = SUBJECT_INFO[subject]?.title || 'TOEFL Coach';
+}
 
 const session = {
   get() { try { return JSON.parse(store.get(SESSION_KEY)); } catch { return null; } },
@@ -124,7 +141,11 @@ async function route() {
       if (!ME.authed) { session.clear(); return loginView(); }
       if (!ME.approved) return pendingView();
     }
+    if (ME.subject && SUBJECT !== ME.subject) setSubject(ME.subject);
+    if (parts[0] === 'choose' || !ME.subject) return chooseView();
     if (!META) META = await api('/api/meta');
+    if (parts[0] === 'settings') return await settingsView();
+    if (SUBJECT === 'gsat') return await gsatRoute(parts, params);
     if (parts[0] === 'practice') return await practice(parts[1], params);
     if (parts[0] === 'attempt') return await attemptView(Number(parts[1]), params);
     if (parts[0] === 'writing') return await writingView(params);
@@ -134,7 +155,6 @@ async function route() {
     if (parts[0] === 'vocab' && parts[1] === 'known') return await vocabKnown();
     if (parts[0] === 'vocab') return await vocabHome(params);
     if (parts[0] === 'progress') return await progressView();
-    if (parts[0] === 'settings') return await settingsView();
     return await todayView();
   } catch (e) {
     if (e instanceof AuthError) return loginView();
@@ -195,6 +215,7 @@ function pendingView() {
 async function logout() {
   const s = session.get();
   session.clear();
+  ME = null; // the next account must not inherit this one's subject or approval
   if (s) authPost('/logout', {}, s.access_token).catch(() => {});
   loginView();
 }
@@ -244,6 +265,7 @@ async function todayView() {
       : `<p class="muted">${esc(plan.phase.zh)}・今天約 ${totalMin} 分鐘</p>`;
 
   setView(`<main>
+    ${(ME.subjects || []).length > 1 ? '<p class="subjbar"><a class="link small" href="#/choose">切換科目</a></p>' : ''}
     <div class="countdown"><span class="days">${Math.max(0, plan.daysLeft)}</span>
       <span class="unit"><b>天</b><span class="muted">到 ${exam.getMonth() + 1}/${exam.getDate()} 考試<br>目標總分 ${fmtBand(s.target)}</span></span></div>
     ${bandsRow(estimates, s.target)}
@@ -1370,14 +1392,388 @@ async function loadTypeHistory(det, before = null) {
   }
 }
 
+// ---------- Choose a subject ----------
+async function chooseView() {
+  const params = new URLSearchParams(location.hash.split('?')[1] || '');
+  const subjects = ME.subjects || [];
+  const pick = async k => {
+    const r = await api('/api/subject', { subject: k });
+    ME.subject = r.subject;
+    setSubject(r.subject);
+    location.hash = '#/';
+    if (location.hash === '#/') route(); // same hash: hashchange does not fire
+  };
+  const to = params.get('to');
+  if (to && subjects.includes(to)) return pick(to); // from the switch in 設定
+  if (subjects.length === 1) return pick(subjects[0]);
+  setView(`<main class="stack">
+    <h2>你今天要練什麼？</h2>
+    <p class="muted small">之後可以在「設定」切換。兩個科目共用每天的 AI 次數。</p>
+    <div class="choose">${subjects.map(k => `<button class="choice" data-k="${k}"><b>${esc(SUBJECT_INFO[k].name)}</b><span>${esc(SUBJECT_INFO[k].desc)}</span></button>`).join('')}</div>
+    <button class="btn ghost block" id="logout">登出</button></main>`, { focus: true });
+  $app.querySelectorAll('.choice').forEach(b => b.onclick = () => { b.disabled = true; pick(b.dataset.k).catch(errorView); });
+  document.getElementById('logout').onclick = logout;
+}
+
+// ---------- 學測翻譯 ----------
+const GSAT_ERR = { spelling: '拼字', grammar: '文法', word: '用字', omission: '漏譯', capital: '大寫', punct: '標點' };
+const fmtPts = v => (v == null ? '—' : Number.isInteger(Number(v)) ? String(Number(v)) : Number(v).toFixed(1));
+
+async function gsatRoute(parts, params) {
+  const p = parts[0] === 'gsat' ? parts.slice(1) : [];
+  if (p[0] === 'practice') return gsatPractice(params);
+  if (p[0] === 'result') return gsatResult(Number(p[1]));
+  if (p[0] === 'bank') return gsatBank();
+  if (p[0] === 'phrases' && p[1] === 'review') return gsatPhraseReview();
+  if (p[0] === 'phrases') return gsatPhrases();
+  if (p[0] === 'progress') return gsatProgress();
+  return gsatToday();
+}
+
+async function gsatToday() {
+  setView(loading(), { tab: 'today' });
+  const [t, pr] = await Promise.all([api('/api/gsat/today'), api('/api/gsat/progress')]);
+  const left = Math.max(0, t.target - t.done);
+  const bubbles = Array.from({ length: t.target }, (_, k) => `<i class="${k < t.done ? 'on' : ''}"></i>`).join('');
+  const switcher = (ME.subjects || []).length > 1 ? '<a class="link small" href="#/choose">切換科目</a>' : '';
+  setView(`<main>
+    <div class="row"><h2 class="spacer">學測翻譯</h2>${switcher}</div>
+    <div class="wstats g3">
+      <div><b>${pr.recentAvg == null ? '—' : fmtPts(Math.round(pr.recentAvg * 10) / 10)}</b><span>近 10 組平均（滿分 8）</span></div>
+      <div><b>${pr.past.done}<small>/${pr.past.total}</small></b><span>考古題完成</span></div>
+      <div><b>${pr.n}</b><span>累計練習組數</span></div></div>
+    <div class="stack">
+      <div class="sheet">
+        <a class="task ${left ? 'next' : 'complete'}" href="#/gsat/practice"><div class="spacer"><div class="name">今天的翻譯</div>
+          <div class="sub">${t.reviewDue ? `先複習 ${t.reviewDue} 組沒拿到 7 分的題目，再做新題` : '從考古題開始，做完再出新題'}${t.settings.timerMinutes ? `・每組 ${t.settings.timerMinutes} 分鐘` : ''}</div></div>
+          <div class="bubbles" aria-label="完成 ${t.done} / ${t.target}">${bubbles}</div></a>
+        <a class="task ${t.phrasesDue ? '' : 'complete'}" href="#/gsat/phrases/review"><div class="spacer"><div class="name">片語複習</div>
+          <div class="sub">${t.phrasesDue ? `${t.phrasesDue} 個到期` : '今天沒有到期的片語'}</div></div><div class="count">${t.phrasesDue}</div></a>
+        <a class="task" href="#/gsat/practice?kind=ai"><div class="spacer"><div class="name">AI 新題</div><div class="sub">依你常錯的地方出題</div></div><span class="muted">›</span></a>
+        <a class="task" href="#/gsat/bank"><div class="spacer"><div class="name">考古題</div><div class="sub">93–114 年，自己挑年份</div></div><span class="muted">›</span></a>
+      </div>
+      ${left ? '' : '<p>今天的份量完成了。想多練可以做 AI 新題，或到題庫挑考古題。</p>'}
+      <details class="rules"><summary>評分方式（大考中心原則）</summary>
+        <ul class="small"><li>每句 4 分，依意思分成前後 2 個部分，各 2 分，兩部分分開計分。</li>
+        <li>每個錯誤扣 0.5 分，扣到該部分 0 分為止；整個部分沒翻或完全譯錯，該部分 0 分。</li>
+        <li>相同的拼字或文法錯誤只扣一次。</li>
+        <li>句首沒大寫、標點不妥，各扣 0.5 分，只扣一次。</li>
+        <li>分數由程式依錯誤清單照上面規則計算，每 0.5 分都看得到原因。</li></ul></details>
+    </div></main>`, { tab: 'today' });
+}
+
+function gsatTimer(started, minutes) {
+  const tick = () => {
+    const el = document.getElementById('timer');
+    if (!el) return clearInterval(timerHandle);
+    const s = (Date.now() - started) / 1000;
+    if (minutes) { const left = minutes * 60 - s; el.textContent = (left < 0 ? '+' : '') + fmtTime(Math.abs(left)); el.classList.toggle('over', left < 0); }
+    else el.textContent = fmtTime(s);
+  };
+  tick(); timerHandle = setInterval(tick, 1000);
+}
+
+async function gsatPractice(params) {
+  setView(loading('準備題目'), { focus: true });
+  const rewrite = Number(params.get('rewrite')) || null;
+  const q = new URLSearchParams();
+  if (params.get('id')) q.set('id', params.get('id'));
+  if (params.get('kind')) q.set('kind', params.get('kind'));
+  const [set, settings, prev] = await Promise.all([api(`/api/gsat/next?${q}`), api('/api/gsat/settings'),
+    rewrite ? api(`/api/gsat/attempt?id=${rewrite}`) : null]);
+  const key = `gsat:draft:${set.id}${rewrite ? `:r${rewrite}` : ''}`;
+  let draft = [];
+  try { draft = JSON.parse(store.get(key) || '[]'); } catch { /* ignore */ }
+  const hints = set.sentences.map(() => false);
+  const started = Date.now();
+  setView(`<div class="ptop"><a class="link" href="#/" aria-label="離開">✕</a>
+      <span class="title">${esc(set.label || '學測翻譯')}</span><span class="spacer"></span><span class="timer" id="timer"></span></div>
+    <main class="stack">
+      ${rewrite ? '<p class="notice small">重寫：照剛才的回饋修改，再交一次看看分數。</p>' : `<p class="muted small">把下面兩句中文翻成英文。每句 4 分。${set.topic_zh ? `主題：${esc(set.topic_zh)}` : ''}</p>`}
+      ${set.sentences.map((s, i) => `<div class="gq">
+        <p class="gzh"><span class="gnum">${i + 1}</span>${esc(s.zh)}</p>
+        <textarea class="gans" data-i="${i}" rows="3" placeholder="在這裡寫英文" autocapitalize="sentences" autocomplete="off" spellcheck="false"></textarea>
+        <div class="row"><span class="muted small wc" data-i="${i}">0 字</span><span class="spacer"></span>
+          ${s.hints.length ? `<button class="link small hintbtn" data-i="${i}">提示</button>` : ''}</div>
+        <div class="ghint" data-i="${i}" hidden>${s.hints.map(h => `<span class="chip-s"><b>${esc(h.en)}</b> ${esc(h.zh)}</span>`).join('')}</div>
+      </div>`).join('')}
+      <button class="btn block" id="submit">送出批改</button>
+      <p class="muted small">拼字檢查已關閉，跟考場一樣。批改大約 20 秒，算 1 次 AI。</p></main>`, { focus: true });
+  gsatTimer(started, settings.timerMinutes);
+  const tas = [...$app.querySelectorAll('.gans')];
+  tas.forEach((ta, i) => {
+    ta.value = draft[i] ?? (prev ? prev.answers[i] || '' : '');
+    const wc = $app.querySelector(`.wc[data-i="${i}"]`);
+    const upd = () => { wc.textContent = `${words(ta.value)} 字`; store.set(key, JSON.stringify(tas.map(x => x.value))); };
+    ta.oninput = upd; upd();
+  });
+  tas[0]?.focus();
+  $app.querySelectorAll('.hintbtn').forEach(b => b.onclick = () => {
+    const i = Number(b.dataset.i);
+    hints[i] = true;
+    $app.querySelector(`.ghint[data-i="${i}"]`).hidden = false;
+    b.remove();
+  });
+  const submit = document.getElementById('submit');
+  submit.onclick = async () => {
+    const answers = tas.map(t => t.value);
+    if (answers.every(a => !a.trim()) && !confirm('兩句都沒寫，確定要送出嗎？')) return;
+    submit.disabled = true; submit.textContent = '批改中，約 20 秒…';
+    clearInterval(timerHandle);
+    try {
+      const r = await api('/api/gsat/submit', { itemId: set.id, answers, hints, seconds: (Date.now() - started) / 1000, rewriteOf: rewrite });
+      store.del(key);
+      location.hash = `#/gsat/result/${r.id}`;
+    } catch (e) {
+      submit.disabled = false; submit.textContent = '重新送出';
+      gsatTimer(started, settings.timerMinutes);
+      alert(`送出失敗：${e.message}\n你的作答還在畫面上，可以再試一次。`);
+    }
+  };
+}
+
+// The learner's answer with each error's words underlined and numbered.
+function markErrors(answer, errors) {
+  const text = String(answer || '');
+  const spans = [];
+  errors.forEach((e, k) => {
+    if (!e.original) return;
+    let from = 0; let at = -1;
+    while ((at = text.indexOf(e.original, from)) !== -1 && spans.some(s => at < s.end && at + e.original.length > s.start)) from = at + 1;
+    if (at === -1) { // try ignoring case
+      const lower = text.toLowerCase(); from = 0;
+      while ((at = lower.indexOf(e.original.toLowerCase(), from)) !== -1 && spans.some(s => at < s.end && at + e.original.length > s.start)) from = at + 1;
+    }
+    if (at !== -1) spans.push({ start: at, end: at + e.original.length, k });
+  });
+  spans.sort((x, y) => x.start - y.start);
+  let out = ''; let pos = 0;
+  for (const sp of spans) {
+    out += esc(text.slice(pos, sp.start)) + `<mark class="gerr">${esc(text.slice(sp.start, sp.end))}<sup>${sp.k + 1}</sup></mark>`;
+    pos = sp.end;
+  }
+  return out + esc(text.slice(pos));
+}
+
+function costLabel(e) {
+  if (e.type === 'omission') return e.cost ? `該部分 0 分` : '—';
+  if (e.cost) return `−${fmtPts(e.cost)}`;
+  if (e.type === 'capital' || e.type === 'punct') return '只扣一次';
+  return e.type === 'spelling' || e.type === 'grammar' ? '重複，不再扣' : '已扣到 0';
+}
+
+async function gsatResult(id) {
+  setView(loading(), { tab: 'today' });
+  const a = await api(`/api/gsat/attempt?id=${id}`);
+  const fb = a.feedback;
+  const prev = a.rewriteOf ? await api(`/api/gsat/attempt?id=${a.rewriteOf}`).catch(() => null) : null;
+  const sentenceBlock = (zh, i) => {
+    const s = fb.sentences[i] || { errors: [], parts: [0, 0], points: 0 };
+    const parts = fb.parts?.[i] || [];
+    return `<section class="gres">
+      <div class="row"><h3 class="spacer"><span class="gnum">${i + 1}</span>${esc(zh)}</h3><b class="gpts">${fmtPts(s.points)}<small>/4</small></b></div>
+      <div class="gparts">${[0, 1].map(p => `<span>${esc(parts[p] || `第 ${p + 1} 部分`)}<b>${fmtPts(s.parts?.[p] ?? 0)}/2</b></span>`).join('')}</div>
+      <p class="small muted" style="margin-bottom:2px">你的翻譯${a.hints[i] ? '（用了提示）' : ''}</p>
+      <div class="card gyour">${a.answers[i] ? markErrors(a.answers[i], s.errors) : '<span class="muted">（沒有作答）</span>'}</div>
+      ${s.errors.length ? `<ol class="gerrs">${s.errors.map(e => `<li>
+          <span class="etag t-${e.type}">${GSAT_ERR[e.type] || e.type}</span><span class="ecost">${costLabel(e)}</span>
+          <div>${e.original ? `<del>${esc(e.original)}</del> → ` : ''}<ins>${esc(e.fix)}</ins></div>
+          <div class="why">${esc(e.why_zh)}</div></li>`).join('')}</ol>`
+        : (a.answers[i] ? '<p class="right small">這句沒有扣分的錯誤。</p>' : '')}
+      ${s.comment_zh ? `<p class="explain small">${esc(s.comment_zh)}</p>` : ''}
+      ${s.minimal_fix && s.errors.length ? `<p class="small muted" style="margin-bottom:2px">最小修改（保留你的寫法）</p><div class="card gfix">${esc(s.minimal_fix)}</div>` : ''}
+      ${s.better?.length ? `<p class="small muted" style="margin-bottom:2px">更道地的寫法</p>${s.better.map(b => `<div class="card gbetter"><div>${esc(b.en)}</div>${b.note_zh ? `<div class="why">${esc(b.note_zh)}</div>` : ''}</div>`).join('')}` : ''}
+      ${fb.refs?.[i]?.length ? `<details class="small"><summary>參考譯法</summary>${fb.refs[i].map(r => `<p>${esc(r)}</p>`).join('')}</details>` : ''}
+    </section>`;
+  };
+  const phrases = (fb.phrases || []).map((p, k) => `<div class="card gphrase">
+      <div class="row"><b class="spacer">${esc(p.phrase)}</b>${p.used ? '<span class="tag ok">你用對了</span>' : ''}
+        <button class="btn ghost small addp" data-k="${k}" ${p.saved ? 'disabled' : ''}>${p.saved ? '已在片語本' : '＋ 片語本'}</button></div>
+      <div>${esc(p.zh)}</div>
+      ${p.example ? `<div class="gex">${esc(p.example)}</div><div class="muted small">${esc(p.example_zh)}</div>` : ''}
+      ${p.note_zh ? `<div class="why">${esc(p.note_zh)}</div>` : ''}</div>`).join('');
+  const chat = c => c.map(x => `<div class="qa"><p class="q">你：${esc(x.q)}</p><p class="a">${esc(x.a)}</p></div>`).join('');
+  setView(`<main class="stack">
+    <p><a class="link" href="#/">← 今天</a></p>
+    <div class="row"><h2 class="spacer">${esc(a.set.label || '學測翻譯')}</h2><span class="muted small">${esc(a.day)}・${fmtTime(a.seconds || 0)}</span></div>
+    <div class="verdict"><span class="mark">${fmtPts(a.score)}<small>/8</small></span>
+      <span class="muted">${prev ? `重寫：${fmtPts(prev.score)} → <b>${fmtPts(a.score)}</b>` : a.score >= 7 ? '很好，接近滿分' : a.score >= 5 ? '有基本分，還有進步空間' : '這組值得重寫一次'}</span></div>
+    ${fb.summary_zh ? `<p>${esc(fb.summary_zh)}</p>` : ''}
+    ${a.set.sentences.map(sentenceBlock).join('')}
+    ${phrases ? `<h3>這組值得記的片語與句型</h3>${phrases}` : ''}
+    ${fb.pitfalls_zh?.length ? `<h3>常見陷阱</h3><ul>${fb.pitfalls_zh.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+    ${fb.next_step_zh ? `<h3>下次的重點</h3><p>${esc(fb.next_step_zh)}</p>` : ''}
+    <h3>問家教</h3>
+    <p class="muted small">對這組批改有疑問可以直接問，例如「這裡可以用 which 嗎？」。每問一次算 1 次 AI，每組最多 8 題。</p>
+    <div id="chat">${chat(fb.chat || [])}</div>
+    <form id="ask" class="askrow"><input class="text" name="q" maxlength="500" placeholder="輸入你的問題" autocomplete="off"><button class="btn">問</button></form>
+    <div class="btn-grid" style="margin-top:8px">
+      <a class="btn ghost block" href="#/gsat/practice?id=${a.itemId}&rewrite=${a.id}">重寫一次</a>
+      <a class="btn block" href="#/gsat/practice">下一組</a></div>
+  </main>`, { tab: 'today' });
+  $app.querySelectorAll('.addp').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try { await api('/api/gsat/phrases/add', { attemptId: a.id, index: Number(b.dataset.k) }); b.textContent = '已在片語本'; }
+    catch (e) { b.disabled = false; alert(e.message); }
+  });
+  document.getElementById('ask').onsubmit = async ev => {
+    ev.preventDefault();
+    const f = ev.target; const btn = f.querySelector('button');
+    const q = f.q.value.trim();
+    if (!q) return;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await api('/api/gsat/ask', { attemptId: a.id, question: q });
+      document.getElementById('chat').innerHTML = chat(r.chat);
+      f.q.value = '';
+    } catch (e) { alert(e.message); }
+    btn.disabled = false; btn.textContent = '問';
+  };
+}
+
+async function gsatBank() {
+  setView(loading(), { tab: 'bank' });
+  const rows = await api('/api/gsat/bank');
+  const row = r => `<a class="brow" href="#/gsat/practice?id=${r.id}">
+      <div class="spacer"><b>${esc(r.label || '新題')}</b><div class="muted small">${esc(r.first || '')}</div></div>
+      ${r.tries ? `<b class="bscore ${r.best >= 7 ? 'good' : ''}">${fmtPts(r.best)}<small>/8</small></b>` : '<span class="muted small">未練習</span>'}</a>`;
+  const past = rows.filter(r => r.source === 'past');
+  const ai = rows.filter(r => r.source !== 'past');
+  setView(`<main class="stack">
+    <h2>題庫</h2>
+    <p class="muted small">分數是你在這組的最高分。93–110 年每年有兩組（學測與指考），111 年起是新制，每年一組。</p>
+    <h3 class="sec">新制考古題（111 年起）</h3><div>${past.filter(r => r.year >= 111).map(row).join('')}</div>
+    <h3 class="sec">93–110 年</h3><div>${past.filter(r => r.year < 111).map(row).join('')}</div>
+    <div class="row"><h3 class="sec spacer">AI 新題</h3><button class="btn ghost small" id="gen">出 3 組新題</button></div>
+    <div>${ai.map(row).join('') || '<p class="muted small">還沒有。按「出 3 組新題」會依你常錯的地方出題（算 1 次 AI）。</p>'}</div>
+  </main>`, { tab: 'bank' });
+  document.getElementById('gen').onclick = async e => {
+    const b = e.currentTarget; b.disabled = true; b.textContent = '出題中，約 30 秒…';
+    try { await api('/api/gsat/generate', {}); gsatBank(); } catch (err) { alert(err.message); b.disabled = false; b.textContent = '出 3 組新題'; }
+  };
+}
+
+async function gsatPhrases() {
+  setView(loading(), { tab: 'phrases' });
+  const { phrases, due } = await api('/api/gsat/phrases');
+  setView(`<main class="stack">
+    <h2>片語本</h2>
+    ${due ? `<a class="btn block" href="#/gsat/phrases/review">複習 ${due} 個到期的片語</a>` : '<p class="muted small">今天沒有到期的片語。</p>'}
+    <p class="muted small">批改結果裡按「＋ 片語本」就會加進來。複習間隔是第 1、2、4、7、14、21、45、90 天，答錯明天重來。</p>
+    <div>${phrases.map(p => `<details class="wrow"><summary><b>${esc(p.phrase)}</b><span class="spacer"></span>
+        <span class="muted small">${esc(p.zh)}</span><span class="muted small due">${dueLabel(p.due_day)}</span></summary>
+        ${p.example ? `<p class="gex">${esc(p.example)}</p><p class="muted small">${esc(p.example_zh)}</p>` : ''}
+        ${p.note ? `<p class="why small">${esc(p.note)}</p>` : ''}
+        <button class="link small delp" data-id="${p.id}">從片語本刪除</button></details>`).join('') || '<p class="muted">片語本還是空的。</p>'}</div>
+  </main>`, { tab: 'phrases' });
+  $app.querySelectorAll('.delp').forEach(b => b.onclick = async () => {
+    if (!confirm('確定刪除這個片語？')) return;
+    await api('/api/gsat/phrases/delete', { id: Number(b.dataset.id) });
+    gsatPhrases();
+  });
+}
+
+// Compare typed phrases loosely: case, punctuation and placeholders (..., sth, sb, someone) don't matter.
+const phraseKey = s => String(s).toLowerCase().replace(/\.{2,}|…/g, ' ').replace(/\b(sth|sb|someone|something|one's|oneself|a|b|n|v|v-ing|ving)\b/g, ' ')
+  .replace(/[^a-z' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+async function gsatPhraseReview() {
+  setView(loading(), { focus: true });
+  const list = await api('/api/gsat/phrases/review');
+  let i = 0; let right = 0;
+  const done = () => setView(`<main class="stack"><h2>片語複習完成</h2><p>${list.length ? `答對 ${right} / ${list.length} 個。` : '今天沒有到期的片語。'}</p>
+    <a class="btn block" href="#/">回到今天</a><a class="btn ghost block" href="#/gsat/phrases">看片語本</a></main>`, { tab: 'phrases' });
+  const show = () => {
+    if (i >= list.length) return done();
+    const p = list[i];
+    setView(`<div class="ptop"><a class="link" href="#/gsat/phrases" aria-label="離開">✕</a><span class="title">片語複習</span><span class="spacer"></span>
+      <span class="muted small">${i + 1} / ${list.length}</span></div>
+      <main class="stack">
+        <p class="muted small">看中文，寫出英文片語或句型。</p>
+        <p class="vzh" style="text-align:center">${esc(p.zh)}</p>
+        ${p.example_zh ? `<p class="muted" style="text-align:center">${esc(p.example_zh)}</p>` : ''}
+        <input class="text" id="pin" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="英文片語">
+        <div id="pback"></div><div class="btn-grid" id="pbtns"><button class="btn block" id="check">看答案</button></div></main>`, { focus: true });
+    const input = document.getElementById('pin');
+    input.focus();
+    const grade = async result => {
+      if (result === 'good') right++;
+      await api('/api/gsat/phrases/grade', { id: p.id, result }).catch(() => {});
+      i++; show();
+    };
+    const check = () => {
+      const ok = input.value.trim() && phraseKey(input.value) === phraseKey(p.phrase);
+      input.disabled = true;
+      document.getElementById('pback').innerHTML = `<div class="card"><p class="${ok ? 'right' : ''}"><b>${esc(p.phrase)}</b></p>
+        ${p.example ? `<p class="gex">${esc(p.example)}</p>` : ''}${p.note ? `<p class="why small">${esc(p.note)}</p>` : ''}
+        ${input.value.trim() ? `<p class="muted small">你寫的：${esc(input.value)}</p>` : ''}</div>`;
+      document.getElementById('pbtns').innerHTML = `<button class="btn ghost block" id="again">答錯了</button><button class="btn block" id="good">答對了</button>`;
+      document.getElementById('again').onclick = () => grade('again');
+      document.getElementById('good').onclick = () => grade('good');
+      document.getElementById(ok ? 'good' : 'again').focus();
+    };
+    document.getElementById('check').onclick = check;
+    input.onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); check(); } };
+  };
+  show();
+}
+
+function scoreChart(points, max, label) {
+  if (points.length < 2) return '';
+  const W = 640, H = 140, P = 8;
+  const x = k => P + (k / (points.length - 1)) * (W - 2 * P);
+  const y = v => H - P - (v / max) * (H - 2 * P);
+  const d = points.map((v, k) => `${k ? 'L' : 'M'}${x(k).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">
+    <line x1="${P}" x2="${W - P}" y1="${y(6)}" y2="${y(6)}" stroke="var(--red)" stroke-dasharray="4 4"/>
+    <text x="${W - P}" y="${y(6) - 6}" text-anchor="end" fill="var(--red)" font-size="14">6 分</text>
+    <path d="${d}" fill="none" stroke="var(--ink)" stroke-width="2.5"/>
+    ${points.map((v, k) => `<circle cx="${x(k)}" cy="${y(v)}" r="3.5" fill="var(--ink)"/>`).join('')}</svg>`;
+}
+
+async function gsatProgress() {
+  setView(loading(), { tab: 'progress' });
+  const p = await api('/api/gsat/progress');
+  setView(`<main class="stack">
+    <h2>學測翻譯進度</h2>
+    <div class="wstats g3">
+      <div><b>${p.recentAvg == null ? '—' : fmtPts(Math.round(p.recentAvg * 10) / 10)}</b><span>近 10 組平均</span></div>
+      <div><b>${p.best == null ? '—' : fmtPts(p.best)}</b><span>最高分</span></div>
+      <div><b>${p.past.done}<small>/${p.past.total}</small></b><span>考古題完成</span></div></div>
+    ${p.trend.length > 1 ? `<h3>分數走勢（滿分 8）</h3>${scoreChart(p.trend, 8, '學測翻譯分數走勢')}` : ''}
+    <h3>最常犯的錯（最近 20 次）</h3>
+    ${p.errors.length ? `<div class="ebars">${p.errors.map(e => `<div class="ebar"><span>${esc(e.label)}</span>
+        <div class="meter"><span style="width:${Math.round(e.share * 100)}%"></span></div><b>${e.count}</b></div>`).join('')}</div>`
+      : '<p class="muted small">還沒有資料。</p>'}
+    <h3>練習紀錄</h3>
+    ${p.history.length ? `<ul class="hist">${p.history.map(h => `<li><a href="#/gsat/result/${h.id}"><span class="spacer">${esc(h.label || '新題')}${h.mode === 'rewrite' ? '<span class="tag plain">重寫</span>' : ''}
+        <span class="muted small" style="display:block">${esc(h.first || '')}</span></span>
+        <span class="muted small">${esc(String(h.day).slice(5))}</span><b>${fmtPts(h.score)}<small>/8</small></b></a></li>`).join('')}</ul>`
+      : '<p class="muted">還沒有練習紀錄。</p>'}
+  </main>`, { tab: 'progress' });
+}
+
 // ---------- Settings ----------
 async function settingsView() {
   setView(loading(), { tab: 'settings' });
-  const [{ plan, vocabSettings: vs }, me] = await Promise.all([api('/api/today'), api('/api/me')]);
+  const me = await api('/api/me');
   ME = me;
-  const s = plan.settings;
-  setView(`<main class="stack"><h2>設定</h2>
-    <form id="settings">
+  const subjects = ME.subjects || [];
+  const switcher = subjects.length > 1 ? `<h2>科目</h2>
+    <div class="seg" role="group" aria-label="切換科目">${subjects.map(k => `<a href="#/choose?to=${k}" class="${k === SUBJECT ? 'on' : ''}"${k === SUBJECT ? ' aria-current="page"' : ''}>${esc(SUBJECT_INFO[k].name)}</a>`).join('')}</div>` : '';
+  let form;
+  if (SUBJECT === 'gsat') {
+    const g = await api('/api/gsat/settings');
+    form = `<h2>學測翻譯</h2><form id="settings">
+      <label class="field"><span>每組作答時間（分鐘，0 = 不計時）</span><input class="text" type="number" min="0" max="60" step="1" name="timerMinutes" value="${g.timerMinutes}"></label>
+      <p class="muted small">正式考試翻譯沒有單題限時，整份英文考科 100 分鐘。想模擬考場節奏，可以設 6–8 分鐘一組。設了時間，超時會變紅提醒，但仍然可以送出。</p>
+      <label class="field"><span>每天練習幾組（一組兩句）</span><input class="text" type="number" min="1" max="6" step="1" name="dailySets" value="${g.dailySets}"></label>
+      <button class="btn block" style="margin-top:20px">儲存</button>
+      <p class="muted small" id="saved" hidden>已儲存。</p></form>`;
+  } else {
+    const { plan, vocabSettings: vs } = await api('/api/today');
+    const s = plan.settings;
+    form = `<h2>TOEFL</h2><form id="settings">
       <label class="field"><span>考試日期</span><input class="text" type="date" name="examDate" value="${esc(s.examDate)}" required></label>
       <label class="field"><span>目標總分（1–6 級；舊制 100 分約等於 5.0）</span>
         <select class="text" name="target">${[3.5, 4, 4.5, 5, 5.5, 6].map(v => `<option ${v === s.target ? 'selected' : ''} value="${v}">${v.toFixed(1)}</option>`).join('')}</select></label>
@@ -1385,16 +1781,24 @@ async function settingsView() {
       <label class="field"><span>週末每天練習（分鐘）</span><input class="text" type="number" min="15" max="300" step="5" name="minutesWeekend" value="${s.minutesWeekend}"></label>
       <label class="field"><span>每天挑幾個新單字</span><input class="text" type="number" min="5" max="150" step="5" name="vocabNewPerDay" value="${vs.newPerDay}"></label>
       <button class="btn block" style="margin-top:20px">儲存</button>
-      <p class="muted small" id="saved" hidden>已儲存，今天的任務已重新安排。</p>
-    </form>
+      <p class="muted small" id="saved" hidden>已儲存，今天的任務已重新安排。</p></form>`;
+  }
+  setView(`<main class="stack"><h2 class="sr-only">設定</h2>
+    ${switcher}
+    ${form}
     <h2>帳號</h2>
     <p>${esc(ME?.email || '')}</p>
-    ${ME?.usage ? `<p class="muted small">今天已用 AI ${ME.usage.used} / ${ME.usage.limit} 次（出題、批改、單字卡各算一次，台灣時間午夜重置）</p>` : ''}
+    ${ME?.usage ? `<p class="muted small">今天已用 AI ${ME.usage.used} / ${ME.usage.limit} 次（出題、批改、追問、單字卡各算一次，兩個科目共用，台灣時間午夜重置）</p>` : ''}
     <button class="btn ghost block" id="logout">登出</button></main>`, { tab: 'settings' });
   document.getElementById('settings').onsubmit = async ev => {
     ev.preventDefault();
     const f = ev.target;
-    await api('/api/settings', { examDate: f.examDate.value, target: Number(f.target.value), minutesWeekday: Number(f.minutesWeekday.value), minutesWeekend: Number(f.minutesWeekend.value), vocabNewPerDay: Number(f.vocabNewPerDay.value) });
+    if (SUBJECT === 'gsat') {
+      const saved = await api('/api/gsat/settings', { timerMinutes: Number(f.timerMinutes.value), dailySets: Number(f.dailySets.value) });
+      f.timerMinutes.value = saved.timerMinutes; f.dailySets.value = saved.dailySets;
+    } else {
+      await api('/api/settings', { examDate: f.examDate.value, target: Number(f.target.value), minutesWeekday: Number(f.minutesWeekday.value), minutesWeekend: Number(f.minutesWeekend.value), vocabNewPerDay: Number(f.vocabNewPerDay.value) });
+    }
     document.getElementById('saved').hidden = false;
   };
   document.getElementById('logout').onclick = logout;

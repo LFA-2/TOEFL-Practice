@@ -14,6 +14,8 @@ import * as bank from './lib/bank.js';
 import * as plan from './lib/plan.js';
 import * as skills from './lib/skills.js';
 import * as vocab from './lib/vocab.js';
+import * as gsat from './lib/gsat.js';
+import { getSetting, setSetting } from './lib/store.js';
 import { Json } from './lib/json.js';
 
 // ---------- database wrapper ----------
@@ -54,11 +56,16 @@ async function readJson(req) {
   try { return JSON.parse(text); } catch { throw new HttpError(400, 'invalid JSON'); }
 }
 
+const SUBJECTS = ['toefl', 'gsat'];
+// Routes any approved account may call; everything else belongs to one subject.
+const COMMON = new Set(['GET /meta', 'POST /subject']);
+const subjectOf = key => (COMMON.has(key) ? null : key.includes(' /gsat/') ? 'gsat' : 'toefl');
+
 const QUOTA_MSG = '今天的 AI 次數已經用完了，明天再試。已經產生好的題目和單字卡仍然可以使用。';
 
 export function createHandler(deps) {
   const userCache = new Map();     // token -> { user, exp }
-  const approvedCache = new Map(); // uid -> exp (only approved users are cached)
+  const approvedCache = new Map(); // uid -> { exp, subjects } (only approved users are cached)
 
   async function userFor(req) {
     const token = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
@@ -97,12 +104,15 @@ export function createHandler(deps) {
     return ctx;
   }
 
-  async function isApproved(ctx) {
-    const exp = approvedCache.get(ctx.uid);
-    if (exp && exp > Date.now()) return true;
-    const row = await ctx.db.one('select approved from public.profiles where id = $1', [ctx.uid]);
-    if (row?.approved) approvedCache.set(ctx.uid, Date.now() + 60_000);
-    return !!row?.approved;
+  // Approval and the subjects this account may use (profiles.subjects), cached for a minute.
+  async function account(ctx) {
+    const hit = approvedCache.get(ctx.uid);
+    if (hit && hit.exp > Date.now()) return { approved: true, subjects: hit.subjects };
+    const row = await ctx.db.one('select approved, subjects from public.profiles where id = $1', [ctx.uid]);
+    const subjects = (Array.isArray(row?.subjects) ? row.subjects : String(row?.subjects || 'toefl,gsat').replace(/[{}]/g, '').split(','))
+      .filter(x => SUBJECTS.includes(x));
+    if (row?.approved) approvedCache.set(ctx.uid, { exp: Date.now() + 60_000, subjects });
+    return { approved: !!row?.approved, subjects };
   }
 
   const routes = {
@@ -168,6 +178,37 @@ export function createHandler(deps) {
       usage: (await db.one('select public.ai_quota_status() as s')).s,
     })),
 
+    // ---------- subject ----------
+    'POST /subject': async (ctx, url, b) => {
+      if (!SUBJECTS.includes(b.subject)) throw new HttpError(400, 'unknown subject');
+      const { subjects } = await account(ctx);
+      if (!subjects.includes(b.subject)) throw new HttpError(403, '這個帳號沒有開放這個科目。');
+      await setSetting(ctx.db, 'subject', b.subject);
+      return { subject: b.subject };
+    },
+
+    // ---------- 學測翻譯 ----------
+    'GET /gsat/today': ctx => ctx.db.tx(db => gsat.todayPlan(db)),
+    'GET /gsat/next': (ctx, url) => gsat.nextSet(ctx, { id: Number(url.searchParams.get('id')) || null, kind: url.searchParams.get('kind') || 'auto' }),
+    'POST /gsat/submit': (ctx, url, b) => gsat.submit(ctx, { itemId: Number(b.itemId), answers: b.answers, hints: b.hints,
+      seconds: Number(b.seconds) || 0, rewriteOf: Number(b.rewriteOf) || null }),
+    'GET /gsat/attempt': async (ctx, url) => {
+      const a = await gsat.getAttempt(ctx.db, Number(url.searchParams.get('id')));
+      if (!a) throw new HttpError(404, 'not found');
+      return a;
+    },
+    'POST /gsat/ask': (ctx, url, b) => gsat.ask(ctx, Number(b.attemptId), b.question),
+    'GET /gsat/bank': ctx => gsat.bank(ctx.db),
+    'POST /gsat/generate': async ctx => ({ ids: await gsat.generateSets(ctx) }),
+    'GET /gsat/progress': ctx => ctx.db.tx(db => gsat.progress(db)),
+    'GET /gsat/phrases': ctx => gsat.phraseList(ctx.db),
+    'GET /gsat/phrases/review': ctx => gsat.phraseReview(ctx.db),
+    'POST /gsat/phrases/add': (ctx, url, b) => gsat.addPhrase(ctx.db, Number(b.attemptId), Number(b.index)),
+    'POST /gsat/phrases/grade': (ctx, url, b) => gsat.gradePhrase(ctx.db, Number(b.id), b.result === 'good' ? 'good' : 'again'),
+    'POST /gsat/phrases/delete': (ctx, url, b) => gsat.deletePhrase(ctx.db, Number(b.id)),
+    'GET /gsat/settings': ctx => gsat.settings(ctx.db),
+    'POST /gsat/settings': (ctx, url, b) => gsat.saveSettings(ctx.db, b),
+
     // ---------- vocabulary ----------
     'GET /vocab/screen': ctx => vocab.screenBatch(ctx, 20),
     'POST /vocab/mark': (ctx, url, b) => vocab.mark(ctx, Number(b.id), String(b.how)),
@@ -222,15 +263,21 @@ export function createHandler(deps) {
       if (key === 'GET /me') {
         if (!user) return json(200, { authed: false }, cors);
         const mctx = context(user.id);
-        const approved = await isApproved(mctx);
-        const usage = approved ? (await mctx.db.one('select public.ai_quota_status() as s')).s : null;
-        return json(200, { authed: true, email: user.email, approved, usage }, cors);
+        const { approved, subjects } = await account(mctx);
+        if (!approved) return json(200, { authed: true, email: user.email, approved, usage: null }, cors);
+        const usage = (await mctx.db.one('select public.ai_quota_status() as s')).s;
+        const saved = await getSetting(mctx.db, 'subject', null);
+        const subject = subjects.includes(saved) ? saved : subjects.length === 1 ? subjects[0] : null; // null: let the user choose
+        return json(200, { authed: true, email: user.email, approved, usage, subjects, subject }, cors);
       }
       const handler = routes[key];
       if (!handler) return json(404, { error: 'not found' }, cors);
       if (!user) return json(401, { error: 'login required' }, cors);
       const ctx = context(user.id);
-      if (!(await isApproved(ctx))) return json(403, { error: '帳號尚未核准。', pending: true }, cors);
+      const acct = await account(ctx);
+      if (!acct.approved) return json(403, { error: '帳號尚未核准。', pending: true }, cors);
+      const needs = subjectOf(key);
+      if (needs && !acct.subjects.includes(needs)) return json(403, { error: '這個帳號沒有開放這個科目。' }, cors);
       const body = req.method === 'POST' ? await readJson(req) : {};
       return json(200, await handler(ctx, url, body), cors);
     } catch (e) {

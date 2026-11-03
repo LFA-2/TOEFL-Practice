@@ -35,6 +35,7 @@ body {
   padding-bottom: calc(72px + env(safe-area-inset-bottom));
 }
 button, input, textarea, select { font: inherit; color: inherit; }
+[hidden] { display: none !important; } /* classes that set display (e.g. .btn, .ghint) must still hide */
 a { color: inherit; }
 :focus-visible { outline: 3px solid var(--hl); outline-offset: 2px; }
 
@@ -292,3 +293,63 @@ body.focus { padding-bottom: 0; }
   .countdown .days { font-size: 4.2rem; }
   .bands .v { font-size: 1.2rem; }
 }
+
+/* ---------- Subjects ---------- */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.choose { display: grid; gap: 12px; }
+.choice { display: flex; flex-direction: column; gap: 6px; text-align: left; padding: 18px 16px; border: 1.5px solid var(--ink); border-radius: var(--radius-l);
+  background: var(--card); cursor: pointer; }
+.choice b { font-size: 1.2rem; }
+.choice span { color: var(--graphite); font-size: .92rem; line-height: 1.5; }
+.choice:hover { background: var(--bubble); }
+.btn.small { min-height: 36px; padding: 0 12px; font-size: .88rem; }
+
+/* ---------- 學測翻譯 ---------- */
+.wstats.g3 b small { font-size: .9rem; color: var(--graphite); font-weight: 400; }
+.gq + .gq { margin-top: 22px; }
+.gzh { font-size: 1.08rem; line-height: 1.7; margin: 0 0 8px; }
+.gnum { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin-right: 8px; border-radius: 50%;
+  background: var(--ink); color: var(--card); font-size: .85rem; font-weight: 700; vertical-align: 2px; }
+textarea.gans { min-height: 0; height: auto; }
+.ghint { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.chip-s { border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 4px 8px; font-size: .88rem; background: var(--card); }
+.gres { border-top: 1.5px solid var(--ink); padding-top: 12px; }
+.gres h3 { margin: 0; font-size: 1.02rem; line-height: 1.6; }
+.gpts { font-size: 1.3rem; white-space: nowrap; }
+.gpts small, .bscore small, .verdict .mark small { color: var(--graphite); font-weight: 400; font-size: .55em; }
+.gparts { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
+.gparts span { display: inline-flex; gap: 8px; align-items: baseline; border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 4px 8px; font-size: .85rem; color: var(--graphite); }
+.gparts b { color: var(--ink); }
+.gyour { line-height: 1.8; overflow-wrap: anywhere; }
+mark.gerr { background: transparent; color: inherit; text-decoration: underline wavy var(--red); text-underline-offset: 4px; }
+mark.gerr sup { color: var(--red); font-weight: 700; margin-left: 1px; }
+.gerrs { padding-left: 22px; margin: 10px 0; }
+.gerrs li { margin-bottom: 10px; }
+.gerrs li::marker { color: var(--red); font-weight: 700; }
+.gerrs del { color: var(--red); }
+.gerrs ins { text-decoration: none; font-weight: 700; color: var(--ok); }
+.etag { display: inline-block; font-size: .75rem; font-weight: 700; border-radius: 4px; padding: 0 6px; margin-right: 6px; border: 1px solid currentColor; color: var(--graphite); }
+.etag.t-omission, .etag.t-grammar { color: var(--red); }
+.ecost { font-size: .8rem; color: var(--red); font-weight: 700; }
+.gfix, .gbetter { margin-bottom: 8px; line-height: 1.7; }
+.gfix { border-left: 3px solid var(--ok); }
+.gphrase + .gphrase { margin-top: 10px; }
+.gphrase .row { align-items: center; margin-bottom: 4px; }
+.gex { font-style: italic; margin: 6px 0 2px; }
+.tag.ok { color: var(--ok); border-color: var(--ok); }
+.qa { border-left: 3px solid var(--rule); padding: 2px 0 2px 10px; margin-bottom: 10px; }
+.qa .q { font-weight: 700; margin: 0 0 4px; }
+.qa .a { margin: 0; white-space: pre-wrap; line-height: 1.7; }
+.askrow { display: flex; gap: 8px; }
+.askrow input { flex: 1; min-width: 0; }
+.brow { display: flex; gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid var(--rule); text-decoration: none; color: inherit; }
+.brow .small { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; }
+.bscore { font-size: 1.1rem; white-space: nowrap; }
+.bscore.good { color: var(--ok); }
+.rules summary { cursor: pointer; font-weight: 700; }
+.rules ul { padding-left: 20px; line-height: 1.7; }
+.ebars { display: grid; gap: 8px; }
+.ebar { display: grid; grid-template-columns: 48px 1fr 36px; gap: 10px; align-items: center; }
+.ebar b { text-align: right; }
+.hist .small { overflow-wrap: anywhere; }
+.subjbar { text-align: right; margin: 0 0 -8px; }

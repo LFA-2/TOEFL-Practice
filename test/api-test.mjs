@@ -197,6 +197,121 @@ await step('daily plan: once every type is measured, it has listening and speaki
   assert.deepEqual(idx, [...idx].sort((x, y) => x - y), 'reading, listening, speaking, writing');
 });
 
+// ---------- 學測翻譯 ----------
+await step('學測: subject choice is saved and shown in /me', async () => {
+  const me = (await a('/me')).data;
+  assert.deepEqual(me.subjects, ['toefl', 'gsat']);
+  assert.equal(me.subject, null, 'not chosen yet');
+  assert.equal((await a('/subject', { subject: 'gsat' })).status, 200);
+  assert.equal((await a('/me')).data.subject, 'gsat');
+  assert.equal((await a('/subject', { subject: 'nope' })).status, 400);
+});
+
+let gset;
+await step('學測: the first set is the newest past paper, prepared once with references kept on the server', async () => {
+  const before = (await a('/me')).data.usage.used;
+  const r = await a('/gsat/next?kind=new');
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  gset = r.data;
+  assert.equal(gset.source, 'past');
+  assert.equal(gset.year, 114);
+  assert.equal(gset.sentences.length, 2);
+  assert.match(gset.sentences[0].zh, /人類的想像和創意/);
+  assert.ok(gset.sentences[0].hints.length >= 1, 'hints for the 提示 button');
+  assert.equal(JSON.stringify(gset).includes('Mock reference'), false, 'reference answers are not sent before answering');
+  assert.equal((await a('/me')).data.usage.used - before, 1, 'one call to prepare');
+  // the second time it is already prepared
+  await a(`/gsat/next?id=${gset.id}`);
+  assert.equal((await a('/me')).data.usage.used - before, 1);
+});
+
+let gattempt;
+await step('學測: scoring follows the CEEC rules (repeat once, capital/punct once each, omitted part = 0)', async () => {
+  const r = await a('/gsat/submit', { itemId: gset.id, answers: ['people protect the enviroment, enviroment,', 'people is happy'], hints: [true, false], seconds: 400 });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  gattempt = r.data;
+  const [s1, s2] = gattempt.feedback.sentences;
+  assert.equal(s1.points, 2.5);
+  assert.deepEqual(s1.parts, [1.5, 2]);
+  assert.deepEqual(s1.errors.map(e => e.cost), [0.5, 0, 0.5, 0.5]);
+  assert.equal(s2.points, 1.5);
+  assert.deepEqual(s2.parts, [1.5, 0]);
+  assert.equal(gattempt.score, 4);
+  assert.equal(gattempt.max, 8);
+  assert.ok(gattempt.feedback.refs[0].length >= 1, 'references after answering');
+  assert.equal(gattempt.feedback.phrases.length, 2);
+  assert.deepEqual(gattempt.hints, [true, false]);
+  await idle();
+});
+
+await step('學測: a blank answer scores 0 without an AI call; a perfect one scores 8', async () => {
+  const before = (await a('/me')).data.usage.used;
+  const blank = (await a('/gsat/submit', { itemId: gset.id, answers: ['', ''] })).data;
+  assert.equal(blank.score, 0);
+  assert.equal((await a('/me')).data.usage.used, before);
+  const perfect = (await a('/gsat/submit', { itemId: gset.id, answers: ['Perfect one.', 'Perfect two.'], rewriteOf: gattempt.id })).data;
+  assert.equal(perfect.score, 8);
+  assert.equal(perfect.mode, 'rewrite');
+  assert.equal(perfect.rewriteOf, gattempt.id);
+  await idle();
+});
+
+await step('學測: follow-up questions are answered and kept with the attempt', async () => {
+  const r = await a('/gsat/ask', { attemptId: gattempt.id, question: '這裡可以用 which 嗎？' });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.chat.length, 1);
+  const again = (await a(`/gsat/attempt?id=${gattempt.id}`)).data;
+  assert.equal(again.feedback.chat[0].q, '這裡可以用 which 嗎？');
+  assert.equal((await a('/gsat/ask', { attemptId: gattempt.id, question: '  ' })).status, 400);
+});
+
+await step('學測: phrase book saves from feedback and reviews on 1, 2, 4 ... days', async () => {
+  assert.equal((await a('/gsat/phrases/add', { attemptId: gattempt.id, index: 0 })).status, 200);
+  await a('/gsat/phrases/add', { attemptId: gattempt.id, index: 0 }); // twice: still one
+  const list = (await a('/gsat/phrases')).data;
+  assert.equal(list.phrases.length, 1);
+  assert.equal(list.phrases[0].phrase, 'take ... for granted');
+  assert.equal(list.due, 0, 'first due tomorrow');
+  const at = (await a(`/gsat/attempt?id=${gattempt.id}`)).data;
+  assert.equal(at.feedback.phrases[0].saved, true);
+  const id = list.phrases[0].id;
+  const g1 = (await a('/gsat/phrases/grade', { id, result: 'good' })).data;
+  assert.equal(g1.step, 1);
+  const g2 = (await a('/gsat/phrases/grade', { id, result: 'again' })).data;
+  assert.equal(g2.step, 0);
+  assert.equal((await a('/gsat/phrases/delete', { id })).status, 200);
+  assert.equal((await a('/gsat/phrases')).data.phrases.length, 0);
+});
+
+await step('學測: today, bank, progress and settings (timer is user-set)', async () => {
+  const t = (await a('/gsat/today')).data;
+  assert.equal(t.done, 2, 'practice attempts today (rewrite not counted)');
+  assert.equal(t.target, 2);
+  const bank = (await a('/gsat/bank')).data;
+  assert.equal(bank.filter(x => x.source === 'past').length, 40);
+  assert.equal(bank[0].year, 114);
+  assert.equal(bank[0].best, 8);
+  const p = (await a('/gsat/progress')).data;
+  assert.equal(p.n, 2);
+  assert.equal(p.past.done, 1);
+  assert.equal(p.past.total, 40);
+  assert.equal(p.errors[0].type, 'spelling');
+  const s = (await a('/gsat/settings', { timerMinutes: 12, dailySets: 3 })).data;
+  assert.deepEqual(s, { timerMinutes: 12, dailySets: 3 });
+  assert.deepEqual((await a('/gsat/settings', { timerMinutes: 999 })).data.timerMinutes, 60);
+  assert.equal((await a('/gsat/settings', { timerMinutes: 0 })).data.timerMinutes, 0, '0 = no timer');
+});
+
+await step('學測: new sets are generated three per AI call when asked', async () => {
+  const before = (await a('/me')).data.usage.used;
+  const r = await a('/gsat/next?kind=ai');
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.source, 'ai');
+  assert.equal((await a('/me')).data.usage.used - before, 1);
+  const bank = (await a('/gsat/bank')).data;
+  assert.equal(bank.filter(x => x.source === 'ai').length, 3);
+});
+
 let screen;
 await step('vocab screening fills the pool via AI', async () => {
   const r = await a('/vocab/screen');
@@ -278,8 +393,24 @@ await step("another user cannot see or change the first user's data", async () =
   const w = (await b('/writing')).data;
   assert.equal(w.items.length, 0, 'writing record is private');
   assert.equal(w.stats.email.n, 0);
+  assert.equal((await b(`/gsat/attempt?id=${gattempt.id}`)).status, 404, '學測 attempts are private');
+  assert.equal((await b('/gsat/ask', { attemptId: gattempt.id, question: 'hi' })).status, 404);
+  assert.equal((await b('/gsat/progress')).data.n, 0);
   // shared bank: generated items are visible to b
   assert.ok(d.stock.find(s => s.type === 'email').total >= 2);
+});
+
+await step('an account limited to 學測 cannot use TOEFL routes, and has its subject preselected', async () => {
+  const c = client(await signup('c@x.com'));
+  await approve('c@x.com');
+  await fetch(`${BASE}/dev/subjects?email=c%40x.com&s=gsat`);
+  const me = (await c('/me')).data;
+  assert.deepEqual(me.subjects, ['gsat']);
+  assert.equal(me.subject, 'gsat');
+  assert.equal((await c('/today')).status, 403);
+  assert.equal((await c('/subject', { subject: 'toefl' })).status, 403);
+  assert.equal((await c('/gsat/today')).status, 200);
+  assert.equal((await c('/meta')).status, 200);
 });
 
 await step('quota: calls stop at the limit with a clear message', async () => {

@@ -25,6 +25,37 @@ function respond(system, prompt) {
     const list = prompt.split('\n').filter(l => l.startsWith('- ') && l.includes('(')).map(l => l.slice(2).split(' ')[0]);
     return j({ quizzes: list.map(w => ({ w, quiz: mockQuiz(w) })) });
   }
+  if (system.includes('中譯英')) {
+    const prepSentence = n => ({ parts: [`第 ${n} 句前半`, `第 ${n} 句後半`], refs: [`Mock reference ${n}a.`, `Mock reference ${n}b.`],
+      hints: [{ zh: '證明', en: 'prove' }], focus_zh: '現在完成式' });
+    if (prompt.startsWith('Prepare this')) return j({ topic_zh: '（測試）主題', sentences: [prepSentence(1), prepSentence(2)] });
+    if (prompt.startsWith('Write ')) {
+      return j({ sets: [1, 2, 3].map(k => ({ topic_zh: `測試主題${counter}-${k}`,
+        sentences: [1, 2].map(n => ({ zh: `（測試新題 ${counter}-${k}）第 ${n} 句中文。`, ...prepSentence(n) })) })) });
+    }
+    if (prompt.startsWith('Score and teach')) {
+      const answers = [...prompt.matchAll(/Learner's translation: """([\s\S]*?)"""/g)].map(m => m[1]);
+      const perfect = a => /perfect/i.test(a);
+      // sentence 1: the same misspelling twice (counted once), plus a missing capital and bad punctuation
+      // sentence 2: part 2 omitted, plus one grammar error in part 1
+      const s1 = perfect(answers[0] || '') ? [] : [
+        { part: 1, type: 'spelling', original: 'enviroment', fix: 'environment', why_zh: '拼字', key: 'enviroment' },
+        { part: 2, type: 'spelling', original: 'enviroment', fix: 'environment', why_zh: '同一個拼字錯誤', key: 'enviroment' },
+        { part: 1, type: 'capital', original: 'people', fix: 'People', why_zh: '句首要大寫', key: 'cap' },
+        { part: 2, type: 'punct', original: ',', fix: '.', why_zh: '句尾用句點', key: 'punct' },
+      ];
+      const s2 = perfect(answers[1] || '') ? [] : [
+        { part: 1, type: 'grammar', original: 'people is', fix: 'people are', why_zh: 'people 是複數', key: 'sv:people-is' },
+        { part: 2, type: 'omission', original: '', fix: 'to protect the earth', why_zh: '後半句沒有翻出來', key: 'omit' },
+      ];
+      return j({ summary_zh: '（測試模式）整體不錯，注意拼字和主詞動詞一致。',
+        sentences: [s1, s2].map((errors, i) => ({ errors, minimal_fix: `Minimal fix ${i + 1}.`, better: [{ en: `Better version ${i + 1}.`, note_zh: '更自然' }], comment_zh: '（測試）評語' })),
+        phrases: [{ phrase: 'take ... for granted', zh: '把…視為理所當然', example: 'We should not take clean water for granted.', example_zh: '我們不該把乾淨的水視為理所當然。', note_zh: 'take + 受詞 + for granted', used: false },
+          { phrase: 'contribute to', zh: '促成；導致', example: 'Stress can contribute to illness.', example_zh: '壓力可能導致疾病。', note_zh: 'to 後面接名詞或動名詞', used: true }],
+        pitfalls_zh: ['不要寫 there have'], next_step_zh: '寫完先檢查主詞和動詞是否一致。' });
+    }
+    if (prompt.includes('is asking about their graded answer')) return j({ answer_zh: '（測試模式）可以，這樣寫也能拿分。' });
+  }
   if (system.includes('"Take an Interview"')) {
     return j({
       score: 3,

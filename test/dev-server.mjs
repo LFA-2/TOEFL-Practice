@@ -128,6 +128,11 @@ http.createServer(async (req, res) => {
       await asSuper('update public.profiles set approved = true where email = $1', [url.searchParams.get('email')]);
       res.writeHead(200); return res.end('ok');
     }
+    if (url.pathname === '/dev/subjects') { // e.g. ?email=x&s=gsat for a 學測-only account
+      await asSuper('update public.profiles set subjects = $2::text[] where email = $1',
+        [url.searchParams.get('email'), `{${url.searchParams.get('s')}}`]);
+      res.writeHead(200); return res.end('ok');
+    }
     if (url.pathname === '/dev/idle') { // wait for background work to finish
       while (pending.size) await Promise.allSettled([...pending]);
       res.writeHead(200); return res.end('idle');

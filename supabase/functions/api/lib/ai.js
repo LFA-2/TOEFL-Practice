@@ -504,6 +504,160 @@ JSON:
   };
 }
 
+// ---------------- 學測翻譯 ----------------
+const GSAT_SYSTEM = `You are a senior high school English teacher in Taiwan and an experienced rater of the 學測 (GSAT) English 中譯英 section, which is scored by the 大考中心 (CEEC) rules:
+- Each sentence is worth 4 points, split into 2 parts of 2 points each (part 1 = the first half of the meaning, part 2 = the second half). Parts are scored independently.
+- Each error costs 0.5 point within its part, down to 0 for that part. A part whose meaning is entirely missing or wrong scores 0.
+- The same spelling or grammar error repeated counts only once.
+- A missing capital at the start of the sentence costs 0.5 once; unsuitable punctuation costs 0.5 once.
+- Any accurate, grammatical translation is acceptable; there is no single correct answer. Do not count style preferences or less elegant but correct wording as errors.
+- Target vocabulary is mostly at levels 1-4 of the 大考中心 word list (some level 5).
+Write every explanation in Traditional Chinese with Taiwan usage (never Simplified characters or mainland terms), in the warm, clear voice of a good tutor. Quote and rewrite English in English.
+Return ONLY one JSON object, no markdown fences.`;
+
+const GSAT_PREP_ITEM = obj({
+  parts: { ...STRS, minItems: 2, maxItems: 2 },
+  refs: { ...STRS, minItems: 1, maxItems: 3 },
+  hints: { type: 'array', items: obj({ zh: STR, en: STR }) },
+  focus_zh: STR,
+}, ['parts', 'refs']);
+
+function cleanPrepSentence(p, zh) {
+  const parts = asList(p?.parts).map(String).map(s => s.trim()).filter(Boolean);
+  const refs = asList(p?.refs).map(String).map(s => s.trim()).filter(Boolean);
+  must(refs.length >= 1, 'refs');
+  return {
+    zh,
+    parts: parts.length >= 2 ? parts.slice(0, 2) : [zh, ''],
+    refs: refs.slice(0, 3),
+    hints: asList(p?.hints).filter(h => h && typeof h === 'object' && h.en).slice(0, 3).map(h => ({ zh: String(h.zh || ''), en: String(h.en) })),
+    focus_zh: String(p?.focus_zh || ''),
+  };
+}
+
+// Scoring parts, reference translations and hints for a past-paper set (saved once, shared).
+async function gsatPrepare(sentences, charge) {
+  const prompt = `Prepare this 學測 translation set for practice and scoring.
+${sentences.map((s, i) => `Sentence ${i + 1}: ${s}`).join('\n')}
+
+For each sentence:
+- "parts": the Chinese sentence split into the 2 scoring parts (2 points each), as a rater would split it, each a contiguous piece of the original Chinese.
+- "refs": 2 natural reference translations a strong student could write (vocabulary at 大考 levels 1-4 where possible).
+- "hints": 1-3 key words or phrases a student is likely to need, as {"zh": Chinese, "en": English}.
+- "focus_zh": the grammar or sentence pattern this sentence tests, in a few Traditional Chinese words (e.g. 現在完成式、分詞構句).
+JSON: {"topic_zh": short topic, "sentences": [{"parts": [2 strings], "refs": [strings], "hints": [{"zh", "en"}], "focus_zh": string}]}`;
+  const schema = obj({ topic_zh: STR, sentences: { type: 'array', items: GSAT_PREP_ITEM } }, ['sentences']);
+  const out = await askJson({ system: GSAT_SYSTEM, prompt, maxTokens: 3000, schema }, o => {
+    must(Array.isArray(o.sentences) && o.sentences.length >= sentences.length, 'sentences');
+    must(o.sentences.slice(0, sentences.length).every(x => x && asList(x.refs).length), 'refs');
+  }, charge);
+  return { topic_zh: String(out.topic_zh || ''), sentences: sentences.map((zh, i) => cleanPrepSentence(out.sentences[i], zh)) };
+}
+
+// New sets in the 學測 style; `focus` lists the learner's frequent mistakes to practise.
+async function gsatGenerate(count, focus, avoid, charge) {
+  const prompt = `Write ${count} new 學測 中譯英 practice sets in the style of the 111-115 學測 papers.
+- Each set: 2 related Chinese sentences on one topic (society, technology, environment, health, school life, culture, Taiwan), 18-35 Chinese characters each, written in natural Taiwanese Mandarin.
+- Each set should test one or two useful patterns: present perfect, participle construction, relative clause, passive voice, comparison, not only... but also, it is ... that/to, cause and effect, concession (although / despite), etc.
+- Vocabulary needed should be mostly at 大考 levels 1-4.
+${focus.length ? `- This learner often makes these mistakes; make some sets give practice on them: ${focus.join('; ')}` : ''}
+${avoid.length ? `- Avoid these topics, already used: ${avoid.join('、')}` : ''}
+For each sentence also give "parts" (the 2 scoring halves of the Chinese), "refs" (2 reference translations), "hints" (1-3 key words {"zh","en"}) and "focus_zh" (the pattern tested).
+JSON: {"sets": [{"topic_zh": string, "sentences": [{"zh": string, "parts": [2 strings], "refs": [strings], "hints": [{"zh","en"}], "focus_zh": string}]}]}`;
+  const schema = obj({ sets: { type: 'array', items: obj({ topic_zh: STR,
+    sentences: { type: 'array', minItems: 2, maxItems: 2, items: obj({ zh: STR, ...GSAT_PREP_ITEM.properties }, ['zh', 'parts', 'refs']) } }, ['sentences']) } });
+  const out = await askJson({ system: GSAT_SYSTEM, prompt, maxTokens: 6000, schema }, o => {
+    must(Array.isArray(o.sets), 'sets');
+    o.sets = o.sets.filter(st => st && Array.isArray(st.sentences) && st.sentences.length >= 2
+      && st.sentences.every(x => x && typeof x.zh === 'string' && x.zh.trim() && asList(x.refs).length));
+    must(o.sets.length >= 1, 'sets');
+  }, charge);
+  return out.sets.map(st => {
+    const ss = st.sentences.slice(0, 2).map(x => cleanPrepSentence(x, x.zh.trim()));
+    return { source: 'ai', label: st.topic_zh ? `新題・${String(st.topic_zh).slice(0, 20)}` : '新題', sentences: ss.map(x => ({ zh: x.zh })),
+      prep: { topic_zh: String(st.topic_zh || ''), sentences: ss } };
+  });
+}
+
+const GSAT_ERROR_TYPES = ['spelling', 'grammar', 'word', 'omission', 'capital', 'punct'];
+
+const GSAT_GRADE_SCHEMA = obj({
+  summary_zh: STR,
+  sentences: { type: 'array', items: obj({
+    errors: { type: 'array', items: obj({
+      part: { type: 'integer', minimum: 1, maximum: 2 },
+      type: { type: 'string', enum: GSAT_ERROR_TYPES },
+      original: STR, fix: STR, why_zh: STR, key: STR,
+    }, ['part', 'type', 'original', 'fix', 'why_zh']) },
+    minimal_fix: STR,
+    better: { type: 'array', items: obj({ en: STR, note_zh: STR }) },
+    comment_zh: STR,
+  }, ['errors', 'minimal_fix']) },
+  phrases: { type: 'array', items: obj({ phrase: STR, zh: STR, example: STR, example_zh: STR, note_zh: STR, used: { type: 'boolean' } }, ['phrase', 'zh']) },
+  pitfalls_zh: STRS,
+  next_step_zh: STR,
+}, ['summary_zh', 'sentences']);
+
+// Finds the errors and writes the tutoring. The points are worked out from the errors in code (gsat.js).
+async function gsatGrade(prep, answers, charge) {
+  const prompt = `Score and teach this 學測 translation answer.
+${prep.sentences.map((s, i) => `Sentence ${i + 1}: ${s.zh}
+  Part 1: ${s.parts[0]}
+  Part 2: ${s.parts[1]}
+  Reference translations (others are fine too): ${s.refs.join(' / ')}
+  Learner's translation: """${answers[i] || ''}"""`).join('\n\n')}
+
+For each sentence list every error that costs points under the CEEC rules:
+- "part": 1 or 2, the part the error is in.
+- "type": spelling | grammar | word (wrong or unnatural word choice, a missing or extra word or detail) | omission (the meaning of that whole part is missing or entirely wrong) | capital (sentence does not start with a capital) | punct (unsuitable punctuation).
+- "original": the exact words from the learner's sentence ("" for an omission); "fix": the corrected words; "why_zh": a short tutor-style explanation.
+- "key": a short id that is the same for a repeated identical mistake (e.g. "spell:enviroment", "sv-agreement:people-is").
+Do not invent errors: a correct alternative translation has no errors. Count each mistake once.
+Also for each sentence: "minimal_fix" (the learner's sentence corrected with as few changes as possible, keeping their structure), "better" (1-2 more natural versions with a short "note_zh" on what makes them better), "comment_zh" (1-2 sentences).
+For the whole set:
+- "phrases": 3-5 phrases or sentence patterns from this set worth memorising for the exam (e.g. "take ... for granted", "strike a balance between A and B"), each with "zh", an "example" sentence, "example_zh", a short "note_zh" on usage, and "used": true if the learner already used it correctly.
+- "pitfalls_zh": up to 3 common traps in this set (Chinglish such as "there have", a missing subject, tense, countable nouns).
+- "summary_zh": 2-3 sentences of overall feedback; "next_step_zh": one concrete thing to do next time.
+JSON: {"summary_zh", "sentences": [{"errors": [{"part", "type", "original", "fix", "why_zh", "key"}], "minimal_fix", "better": [{"en", "note_zh"}], "comment_zh"}], "phrases": [{"phrase", "zh", "example", "example_zh", "note_zh", "used"}], "pitfalls_zh": [strings], "next_step_zh"}`;
+  const fb = await askJson({ system: GSAT_SYSTEM, prompt, maxTokens: 5000, schema: GSAT_GRADE_SCHEMA }, o => {
+    must(Array.isArray(o.sentences) && o.sentences.length >= prep.sentences.length, 'sentences');
+  }, charge);
+  const s = v => (v === undefined || v === null ? '' : String(v));
+  return {
+    summary_zh: s(fb.summary_zh),
+    sentences: prep.sentences.map((_, i) => {
+      const x = fb.sentences[i] && typeof fb.sentences[i] === 'object' ? fb.sentences[i] : {};
+      return {
+        errors: asList(x.errors).filter(e => e && typeof e === 'object').map(e => ({
+          part: Number(e.part) === 2 ? 2 : 1,
+          type: GSAT_ERROR_TYPES.includes(e.type) ? e.type : 'word',
+          original: s(e.original), fix: s(e.fix), why_zh: s(e.why_zh), key: s(e.key),
+        })),
+        minimal_fix: s(x.minimal_fix),
+        better: asList(x.better).filter(b => b && typeof b === 'object' && b.en).slice(0, 2).map(b => ({ en: s(b.en), note_zh: s(b.note_zh) })),
+        comment_zh: s(x.comment_zh),
+      };
+    }),
+    phrases: asList(fb.phrases).filter(p => p && typeof p === 'object' && p.phrase).slice(0, 6)
+      .map(p => ({ phrase: s(p.phrase).trim(), zh: s(p.zh), example: s(p.example), example_zh: s(p.example_zh), note_zh: s(p.note_zh), used: p.used === true })),
+    pitfalls_zh: asList(fb.pitfalls_zh).map(s).slice(0, 3),
+    next_step_zh: s(fb.next_step_zh),
+  };
+}
+
+// A follow-up question to the tutor about one graded answer.
+async function gsatAsk(context, chat, question, charge) {
+  const prompt = `A student practising 學測 translation is asking about their graded answer.
+${context}
+${chat.length ? `Earlier questions in this conversation:\n${chat.map(c => `Q: ${c.q}\nA: ${c.a}`).join('\n')}\n` : ''}
+The student now asks: """${question}"""
+Answer like a patient tutor in Traditional Chinese (Taiwan usage), 2-6 sentences, with a short English example when it helps. If the student proposes an alternative wording, say plainly whether it is acceptable on the exam and why. Stay on English and this exam.
+JSON: {"answer_zh": string}`;
+  const out = await askJson({ system: GSAT_SYSTEM, prompt, maxTokens: 1200, schema: obj({ answer_zh: STR }) },
+    o => must(typeof o.answer_zh === 'string' && o.answer_zh.trim(), 'answer'), charge);
+  return out.answer_zh.trim();
+}
+
 // ---------------- Vocabulary ----------------
 const VOCAB_SYSTEM = `You help a Taiwanese university student build vocabulary for the 2026 TOEFL iBT.
 All Chinese must be Traditional Chinese with Taiwan usage (e.g. 資訊, 軟體, 品質; never Simplified characters or mainland terms).
@@ -605,7 +759,7 @@ JSON: {"quizzes": [{"w": string, "quiz": {"sentence", "distractors": [{"w", "why
 
 export function makeAi(env) {
   Object.assign(config, env);
-  return { generate, grade, gradeInterview, vocabCandidates, vocabCards, vocabQuizzes };
+  return { generate, grade, gradeInterview, vocabCandidates, vocabCards, vocabQuizzes, gsatPrepare, gsatGenerate, gsatGrade, gsatAsk };
 }
 
 export { AiError, cefrFor };
